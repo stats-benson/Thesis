@@ -1,0 +1,245 @@
+---
+title: "Testing Area"
+author: "Jacob Benson" 
+header-includes:
+  - \usepackage{float}
+  - \floatplacement{figure}{H}
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE,message=FALSE,warning=FALSE, fig.align = 'center', out.width="80%" )
+library(dplyr)
+library(car)
+library(ggplot2)
+library(mosaic)
+library(tidyr)
+library(emmeans)  
+library(psych)  # for levene
+library(effects) # for adjusted means
+library(lsr) # for effect sizes
+library(multcomp)  # for post hocs
+library(apa)
+library(ez)
+library(plotly)
+library(reshape2)
+library(nlme)
+library(lmtest)
+library(GGally)
+library(patchwork)
+library(broom.mixed)
+library(ggrepel)
+library(knitr)
+library(kableExtra)
+library(rstan)
+library(lme4)
+library(lattice)
+
+```
+
+# Loads in the MASSIVE DATASET
+
+
+comparison between a different teacher evaluation metric, deficiencies of 
+
+
+
+
+
+Data obtained from : 
+
+```{r}
+#edu_data <- read_sas("~/Documents/Stats/Thesis/ECLSK_1998-99_v1_0_SAS_Datasets/eclsk_98_99_k8_child_v1_0.sas7bdat")
+```
+
+```{r}
+edu_subset <- edu_data %>%
+  select(
+    # Identifiers
+    CHILDID, 
+    T4_ID, 
+    S4_ID,
+    post_test = C4R4RSCL,
+    pre_test = C2R4RSCL,
+    ses    = WKSESL,
+    race   = RACE,
+    gender = GENDER,
+    age_k     = R2_KAGE,
+    age_g1    = R4AGE,
+    weight = C24CW0
+  )%>%
+  filter(!is.na(post_test), !is.na(T4_ID))
+
+```
+
+```{r}
+# prints all column names containing "AGE"
+names(edu_data)[grep("YEAR", names(edu_data), ignore.case = TRUE)]
+
+```
+
+
+Students within teacher random effects 
+
+```{r}
+vam_model <- lmer(post_test ~ pre_test + ses + race + gender + age_k + age_g1 + (1 | T4_ID), 
+                  data = edu_subset,
+                  weights = weight,
+                  REML = TRUE)
+summary(vam_model)
+teacher_effects <- ranef(vam_model)$T4_ID
+head(teacher_effects[order(teacher_effects$`(Intercept)`, decreasing = TRUE), , drop = FALSE])
+
+```
+
+Student within Teacher within School 
+
+
+```{r}
+vam_model_nested <- lmer(post_test ~ pre_test + ses + race + gender + age_k + age_g1 + (1 | S4_ID/T4_ID), 
+                         data = edu_subset,
+                         weights = weight)
+summary(vam_model_nested)
+```
+
+```{r}
+
+dotplot(ranef(vam_model, condVar = TRUE))
+```
+
+Signal weighted:
+
+$$y_{ijt} \sim N(\alpha_i\theta_j, \frac{1}{a_i})$$
+Where:
+
+$\alpha_i$ : Student Reliability
+$\theta_j$ : Teacher Effect
+$a_i$ : Student Sensitivity (how responsive they are to the teacher)
+
+
+
+```{r}
+library(rstan)
+
+# Create integer IDs for Stan
+edu_subset$student_idx <- as.integer(as.factor(edu_subset$CHILDID))
+edu_subset$teacher_idx <- as.integer(as.factor(edu_subset$T4_ID))
+
+stan_data <- list(
+  N = nrow(edu_subset),
+  S = length(unique(edu_subset$CHILDID)),
+  T = length(unique(edu_subset$T4_ID)),
+  student_id = edu_subset$student_idx,
+  teacher_id = edu_subset$teacher_idx,
+  y = edu_subset$post_test,
+  # Add other covariates (pre-test, SES, etc.) as a matrix if needed
+  x = as.matrix(edu_subset[, c("pre_test", "ses")]) 
+)
+```
+
+
+
+```{r}
+fit <- stan(file = "sw_stan.stan", data = stan_data, iter = 100, chains = 4)
+# Extract Teacher Effects
+teacher_results <- summary(fit, pars = "theta")$summary
+```
+```{r}
+print(fit, pars = c("theta", "sigma"))
+```
+
+```{r}
+# Extract teacher effects and join back to your names/IDs
+teacher_results <- as.data.frame(summary(fit, pars = "theta")$summary)
+teacher_results$T4_ID <- levels(as.factor(edu_subset$T4_ID))
+
+# Look for the "Value-Added" in the 'mean' column
+head(teacher_results[order(teacher_results$mean, decreasing = TRUE), ])
+
+```
+
+```{r}
+traceplot(fit, pars = "theta[1]") 
+
+```
+```{r}
+# Extract Teacher Estimates
+teacher_summary <- as.data.frame(summary(fit, pars = "theta")$summary) %>%
+  mutate(T4_ID = levels(as.factor(edu_subset$T4_ID))) %>%
+  rename(estimate = mean, se = sd) %>%
+  arrange(estimate) %>%
+  mutate(rank = -row_number())
+
+top_teachers <- tail(teacher_summary, n=10)
+
+
+# Teacher-Level Plot
+p_teacher <- ggplot(top_teachers, aes(x = rank, y = estimate)) +
+  geom_pointrange(aes(ymin = `2.5%`, ymax = `97.5%`, size = 0.5/se^2), 
+                  alpha = 0.6, color = "midnightblue") +
+  scale_size_continuous(name = "Precision (1/var)") +
+  theme_minimal() +
+  labs(title = "Teacher Value-Added Rankings (SW-VAM)",
+       subtitle = "Larger points indicate higher signal reliability",
+       x = "Teacher Rank", y = "Estimated Effect (theta)")
+
+print(p_teacher)
+```
+```{r}
+# Extract Student Parameters (assuming alpha and a are in your Stan model)
+student_params <- data.frame(
+  CHILDID = levels(as.factor(edu_subset$CHILDID)),
+  alpha = summary(fit, pars = "alpha")$summary[, "mean"],
+  sensitivity = summary(fit, pars = "a")$summary[, "mean"]
+)
+
+# Student-Level Diagnostic Plot
+p_student <- ggplot(student_params, aes(x = sensitivity, y = alpha)) +
+  geom_hex(bins = 30) + 
+  scale_fill_viridis_c(option = "magma") +
+  geom_smooth(method = "lm", color = "cyan", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Student-Level Signal Quality",
+       subtitle = "Relationship between Reliability (alpha) and Sensitivity (a)",
+       x = "Sensitivity (a_i)", y = "Reliability (alpha_i)")
+
+print(p_student)
+
+```
+```{r}
+teacher_results <- as.data.frame(summary(fit, pars = "theta")$summary)
+
+teacher_results$T4_ID <- levels(as.factor(edu_subset$T4_ID))
+
+teacher_results <- teacher_results %>%
+  rename(estimate = mean, se = sd, lower = `2.5%`, upper = `97.5%`) %>%
+  arrange(estimate) %>%
+  mutate(rank = row_number())
+
+
+```
+
+
+
+```{r}
+
+student_sensitivity <- summary(fit, pars = "a")$summary[, "mean"]
+
+
+edu_subset$stan_resid <- edu_subset$post_test - (summary(fit, pars="alpha")$summary[edu_subset$student_idx, "mean"] * 
+                                                 teacher_results$estimate[edu_subset$teacher_idx])
+
+# 3. Plot residuals by Sensitivity
+ggplot(edu_subset, aes(x = student_sensitivity[student_idx], y = stan_resid)) +
+  geom_bin2d(bins = 50) + 
+  scale_fill_viridis_c() +
+  geom_smooth(method = "lm", color = "red") +
+  theme_minimal() +
+  labs(title = "Student-Level Diagnostic",
+       x = "Student Sensitivity (a_i)", y = "Model Residuals")
+
+```
+
+
+
