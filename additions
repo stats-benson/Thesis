@@ -1,0 +1,21 @@
+What Kim (2022) contributes:
+
+α_i * θ_j — student sensitivity scaling the teacher effect
+1/a_i — student-specific residual precision
+Showing these parameters reduce variance in teacher estimates under the right data conditions
+
+What your composite adds on top:
+Addition 1 — CVA covariate structure (β * y_{i,t-1} + γ'X_it + δ*P_it + ζ'S_j)
+Kim explicitly leaves this out. His Section 4 footnote states he "directly generates second-stage residuals as the outcome variable, which in practice presumes sufficient data to calculate second-stage residuals." His empirical analysis (Section 6) does include covariates but only in the first step of a two-step procedure — the SWVAM itself never sees them. Your contribution is integrating bias-reduction covariates directly into the signal-weighted likelihood in a single step. Kim notes this is "easily implementable" but never does it.
+Addition 2 — Peer achievement (δ * P_it)
+Not in Kim at all. This addresses a specific criticism of VAMs — that teachers are penalised for having low-achieving peer groups — which Kim's model doesn't speak to.
+Addition 3 — School characteristics (ζ'S_j)
+Also not in Kim. Addresses between-school variation in teacher effect estimates.
+Addition 4 — r_i * η_i (the problematic term)
+This is the most ambitious addition — a student latent trait weighted by reliability. It's theoretically motivated by IRT literature (which Kim cites but doesn't fully implement) but as we found is unidentifiable on ECLS-K data. The honest thesis treatment is to propose it, show why it's unidentifiable, and justify dropping it as a principled empirical decision rather than a theoretical failure.
+So your composite even without r_i * η_i is:
+y_ijt = mu_t + a_i * θ_j + β*y_{i,t-1} + γ'X_it + δ*P_it + ζ'S_j + ε_ijt
+        ε_ijt ~ N(0, 1/sqrt(a_i))
+This is a one-step full-covariate SWVAM that Kim proposed as future work but never implemented — that's a clean, defensible thesis contribution. You can frame it as:
+
+"Kim (2022) demonstrated that signal weighting reduces variance in teacher effect estimates but deliberately excluded demographic covariates to isolate the contribution of student parameters. The present study extends Kim's framework by integrating covariate bias-reduction directly into the signal-weighted likelihood, addressing both the variance and bias problems simultaneously in a single estimation step."
