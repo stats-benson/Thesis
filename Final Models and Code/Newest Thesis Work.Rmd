@@ -1,0 +1,247 @@
+---
+title: "Models"
+output: html_document
+date: "2026-03-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(LaF)
+library(haven)
+```
+
+
+
+
+Section 1: Data cleaning + Loading 
+
+
+```{r}
+SUBJECT <- "math"   # ← change to "reading" if needed
+
+DATA_PATH <- "~/Stats/Thesis/ECLSK_1998-99_v1_0_R_Datasets/ECLSK_98_99_K8_CHILD_v1_0.rdata"  # ← update to your .dat file path
+
+```
+
+```{r}
+load("~/Stats/Thesis/ECLSK_1998-99_v1_0_R_Datasets/ECLSK_98_99_K8_CHILD_v1_0.rdata")
+```
+
+
+```{r}
+raw <- ECLSK_98_99_K8_CHILD_v1_0
+
+```
+```{r}
+raw <- raw |>
+  zap_labels() |>          # strips haven_labelled → plain numeric/character
+  mutate(across(where(is.numeric), ~ {
+    x <- .
+    x[x %in% c(-1, -2, -4, -7, -8, -9)] <- NA_real_
+    x
+  }))
+```
+
+
+```{r}
+# ── 3. Unify teacher ID to subject ────────────────────────────────────────────
+# Waves 6 and 7 have separate reading vs. math teacher IDs.
+# We pick the right one based on SUBJECT.
+raw <- raw |>
+  mutate(
+    teacher_C6 = if (SUBJECT == "math") J62T_ID else J61T_ID,
+    teacher_C7 = if (SUBJECT == "math") J72T_ID else J71T_ID
+  )
+```
+
+```{r}
+# ── 4. Rename score columns to a uniform name ─────────────────────────────────
+score_suffix <- if (SUBJECT == "math") "MSCL" else "RSCL"
+
+raw <- raw |>
+  rename(
+    score_C1 = paste0("C1R4", score_suffix),
+    score_C2 = paste0("C2R4", score_suffix),
+    score_C3 = paste0("C3R4", score_suffix),
+    score_C4 = paste0("C4R4", score_suffix),
+    score_C5 = paste0("C5R4", score_suffix),
+    score_C6 = paste0("C6R4", score_suffix),
+    score_C7 = paste0("C7R4", score_suffix)
+  )
+```
+
+```{r}
+
+# ── 5. Reshape to long ────────────────────────────────────────────────────────
+#
+# Waves with teacher IDs: C1, C2, C4, C5, C6, C7
+# C3 has no teacher ID → used only as the prior score for C4
+#
+# Each wave brings:  score, prior_score (previous wave), teacher_id, school_id
+
+wave_info <- tibble(
+  wave       = c("C1", "C2", "C4", "C5", "C6", "C7"),
+  year       = c(1998L, 1999L, 2000L, 2002L, 2004L, 2007L),
+  score_col  = c("score_C1", "score_C2", "score_C4", "score_C5", "score_C6", "score_C7"),
+  prior_col  = c(NA,         "score_C1", "score_C3", "score_C4", "score_C5", "score_C6"),
+  teach_col  = c("T1_ID",    "T2_ID",    "T4_ID",    "T5_ID",    "teacher_C6", "teacher_C7"),
+  school_col = c("S1_ID",    "S2_ID",    "S4_ID",    "S5_ID",    "S6_ID",     "S7_ID")
+)
+
+long_list <- vector("list", nrow(wave_info))
+
+for (i in seq_len(nrow(wave_info))) {
+  w   <- wave_info[i, ]
+  tmp <- raw |>
+    select(
+      CHILDID,
+      GENDER, RACE, P1DISABL, WKSESL, WKPOV_R,
+      score      = all_of(w$score_col),
+      teacher_id = all_of(w$teach_col),
+      school_id  = all_of(w$school_col)
+    ) |>
+    mutate(
+      wave = w$wave,
+      year = w$year,
+      prior_score = if (is.na(w$prior_col)) NA_real_ else raw[[w$prior_col]]
+    )
+  long_list[[i]] <- tmp
+}
+
+long <- bind_rows(long_list)
+message(sprintf("  Long data: %d rows before filtering", nrow(long)))
+```
+
+```{r}
+
+# ── 6. Filter ──────────────────────────────────────────────────────────────────
+# Keep only rows where we have:
+#   • a valid outcome score
+#   • a valid prior score (drops wave C1 since it has no prior)
+#   • a non-missing teacher ID
+long_clean <- long |>
+  filter(
+    !is.na(score),
+    !is.na(prior_score),
+    !is.na(teacher_id)
+  )
+message(sprintf("  After filtering: %d rows, %d unique children, %d unique teachers",
+                nrow(long_clean),
+                n_distinct(long_clean$CHILDID),
+                n_distinct(long_clean$teacher_id)))
+
+```
+
+```{r}
+long_clean <- long_clean |>
+  mutate(
+    female   = as.integer(GENDER == 2),
+    black    = as.integer(RACE == 2),
+    hispanic = as.integer(RACE == 3),
+    asian    = as.integer(RACE == 4),
+    other_race = as.integer(RACE == 5),   # White (1) is reference
+    disabled = as.integer(P1DISABL == 1),
+    poverty  = as.integer(WKPOV_R == 1)
+  )
+```
+
+
+```{r}
+score_mean  <- mean(long_clean$score,       na.rm = TRUE)
+score_sd    <- sd(long_clean$score,         na.rm = TRUE)
+prior_mean  <- mean(long_clean$prior_score, na.rm = TRUE)
+prior_sd    <- sd(long_clean$prior_score,   na.rm = TRUE)
+ses_mean    <- mean(long_clean$WKSESL,      na.rm = TRUE)
+ses_sd      <- sd(long_clean$WKSESL,        na.rm = TRUE)
+
+long_clean <- long_clean |>
+  mutate(
+    y_std      = (score       - score_mean) / score_sd,
+    y_prev_std = (prior_score - prior_mean) / prior_sd,
+    ses_std    = (WKSESL      - ses_mean)   / ses_sd
+  )
+```
+
+
+
+
+```{r}
+
+# ── 9. Re-index teacher IDs to contiguous 1..J ────────────────────────────────
+teacher_index <- long_clean |>
+  distinct(teacher_id) |>
+  arrange(teacher_id) |>
+  mutate(teacher_idx = row_number())
+
+long_clean <- long_clean |>
+  left_join(teacher_index, by = "teacher_id")
+
+# ── 10. Build covariate matrix X ──────────────────────────────────────────────
+# Columns: female, black, hispanic, asian, other_race, disabled, poverty, ses_std
+# (Intercept is handled inside the Stan model via mu0)
+
+X_mat <- long_clean |>
+  select(female, black, hispanic, asian, other_race, disabled, poverty, ses_std) |>
+  as.matrix()
+
+# Replace any remaining NAs in X with column means (simple imputation)
+# For a more principled approach, consider multiple imputation before this step.
+col_means <- colMeans(X_mat, na.rm = TRUE)
+for (k in seq_len(ncol(X_mat))) {
+  X_mat[is.na(X_mat[, k]), k] <- col_means[k]
+}
+
+# ── 11. Assemble stan_data ─────────────────────────────────────────────────────
+stan_data <- list(
+  N          = nrow(long_clean),
+  J          = max(long_clean$teacher_idx),
+  K          = ncol(X_mat),
+  y          = long_clean$y_std,
+  y_prev     = long_clean$y_prev_std,
+  X          = X_mat,
+  teacher_id = long_clean$teacher_idx
+)
+
+message("stan_data ready:")
+message(sprintf("  N = %d observations", stan_data$N))
+message(sprintf("  J = %d teachers",     stan_data$J))
+message(sprintf("  K = %d covariates",   stan_data$K))
+```
+```{r}
+
+# ── 12. Fit with cmdstanr ─────────────────────────────────────────────────────
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+
+mod <- cmdstan_model("cva_model.stan")
+
+fit <- mod$sample(
+  data            = stan_data,
+  seed            = 42,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 1000,
+  iter_sampling   = 2000,
+  refresh         = 200
+)
+
+# ── 13. Quick diagnostics ──────────────────────────────────────────────────────
+fit$diagnostic_summary()
+fit$summary(variables = c("mu0", "beta", "tau", "sigma"))
+
+# ── 14. Teacher effect estimates ──────────────────────────────────────────────
+theta_summary <- fit$summary("theta", mean, sd, ~quantile(.x, c(0.05, 0.95))) |>
+  rename(mean = mean, sd = sd, q05 = `5%`, q95 = `95%`) |>
+  mutate(
+    teacher_idx = as.integer(str_extract(variable, "\\d+")),
+    # Back-join to original teacher IDs
+    teacher_id  = teacher_index$teacher_id[teacher_idx]
+  ) |>
+  arrange(mean)
+
+print(theta_summary)
+```
+
+

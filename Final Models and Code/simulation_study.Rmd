@@ -1,0 +1,696 @@
+---
+title: "Simulation Study: VAM Model Recovery"
+subtitle: "Replicating and extending Kim (2022) Section 4-5"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(cmdstanr)
+library(posterior)
+library(MASS)
+```
+
+## Overview
+
+This simulation study mirrors Kim (2022) Section 4 to evaluate how well each
+model recovers true teacher quality under three data-generating scenarios:
+
+- **Scenario A** — Student parameters are *invariant*: each student has their
+  own stable alpha_i and a_i across grades. Favours SWVAM.
+- **Scenario B** — Student parameters are *identical*: all students share the
+  same parameters. Favours CVA (traditional VAM).
+- **Scenario C** — Student parameters are *random*: new parameters drawn
+  independently each grade. Neither model's assumptions hold.
+
+Performance is measured by (1) correlation of estimates with true teacher
+quality and (2) proportion of teachers correctly assigned to quality quartile,
+following Kim (2022) Tables 2 and 3.
+
+---
+
+## 1. Data-generating process
+
+```{r dgp}
+simulate_data <- function(
+    n_teachers = 20,
+    n_students = 200,
+    n_grades   = 3,
+    n_schools  = 4,
+    scenario   = "A",
+    rho        = 0.7,
+    seed       = 141229
+) {
+  set.seed(seed)
+
+  # ── True effects ────────────────────────────────────────────────────────────
+  theta_true     <- rnorm(n_teachers)
+  school_effects <- rnorm(n_schools, 0, 0.3)
+
+  # ── School assignments ──────────────────────────────────────────────────────
+  # Teachers evenly distributed across schools
+  teacher_school <- rep(1:n_schools, length.out = n_teachers)
+
+  # Students evenly distributed across schools
+  student_school <- rep(1:n_schools, length.out = n_students)
+
+  # ── Student-teacher assignments (within school) ─────────────────────────────
+  assign_one_grade <- function() {
+    assignment <- integer(n_students)
+    for (s in 1:n_schools) {
+      school_students <- which(student_school == s)
+      school_teachers <- which(teacher_school == s)
+      assignment[school_students] <- sample(
+        rep(school_teachers, length.out = length(school_students))
+      )
+    }
+    assignment
+  }
+
+  teacher_assign <- matrix(
+    replicate(n_grades, assign_one_grade()),
+    nrow = n_students, ncol = n_grades
+  )
+
+  # ── Student parameters ──────────────────────────────────────────────────────
+  if (scenario == "A") {
+    # Each student has own params, stable across grades
+    alpha_i   <- rlnorm(n_students, log(0.2), log(2) / 2)
+    a_i       <- rlnorm(n_students, log(1.0), log(2) / 2)
+    alpha_mat <- matrix(rep(alpha_i, n_grades), nrow = n_students)
+    a_mat     <- matrix(rep(a_i,     n_grades), nrow = n_students)
+
+  } else if (scenario == "B") {
+    # All students share one set of parameters
+    alpha_shared <- rlnorm(1, log(0.2), log(2) / 2)
+    a_shared     <- rlnorm(1, log(1.0), log(2) / 2)
+    alpha_mat    <- matrix(alpha_shared, nrow = n_students, ncol = n_grades)
+    a_mat        <- matrix(a_shared,     nrow = n_students, ncol = n_grades)
+
+  } else if (scenario == "C") {
+    # New params drawn for every student-grade combination
+    alpha_mat <- matrix(
+      rlnorm(n_students * n_grades, log(0.2), log(2) / 2),
+      nrow = n_students
+    )
+    a_mat <- matrix(
+      rlnorm(n_students * n_grades, log(1.0), log(2) / 2),
+      nrow = n_students
+    )
+  }
+
+  # ── AR(1) cross-wave covariance structure ───────────────────────────────────
+  # Captures persistent student ability across grades — gives TVAAS
+  # something to learn that CVA/SWVAM cannot exploit
+  Sigma_base <- rho^abs(outer(1:n_grades, 1:n_grades, "-"))
+
+  # ── Generate outcomes ───────────────────────────────────────────────────────
+  rows <- vector("list", n_students * n_grades)
+  k    <- 1L
+
+  for (i in seq_len(n_students)) {
+    j_vec <- teacher_assign[i, ]
+
+    # School effect from first grade teacher (stable within school)
+    s <- teacher_school[j_vec[1]]
+
+    # Mean vector across grades — teacher + school
+    mu_vec <- sapply(seq_len(n_grades), function(g) {
+      alpha_mat[i, g] * theta_true[j_vec[g]] + school_effects[s]
+    })
+
+    # Student-specific precision scales covariance
+    # Use first grade a_i as the baseline precision
+    sigma_i <- 1.0 / sqrt(a_mat[i, 1])
+    Sigma_i <- Sigma_base * sigma_i^2
+
+    # Draw all grades jointly — this is the key change for TVAAS
+    scores_i <- MASS::mvrnorm(1, mu_vec, Sigma_i)
+
+    for (g in seq_len(n_grades)) {
+      rows[[k]] <- list(
+        student_id = i,
+        teacher_id = j_vec[g],
+        school_id  = s,
+        grade      = g,
+        y          = scores_i[g]
+      )
+      k <- k + 1L
+    }
+  }
+
+  data <- bind_rows(rows)
+
+  list(
+    data           = data,
+    theta_true     = theta_true,
+    school_effects = school_effects,
+    teacher_school = teacher_school,
+    student_school = student_school
+  )
+}
+```
+
+---
+
+## 2. Stan data builders
+
+```{r stan_builders}
+# CVA stan_data — no real covariates in simulation (Kim Section 4 footnote),
+# so we pass a dummy zero column for X and zero vector for y_prev
+make_sim_cva_data <- function(df, n_teachers) {
+  list(
+    N          = nrow(df),
+    J          = n_teachers,
+    K          = 1L,
+    y          = df$y,
+    y_prev     = rep(0.0, nrow(df)),
+    X          = matrix(0.0, nrow(df), 1L),
+    teacher_id = df$teacher_id
+  )
+}
+
+# SWVAM stan_data
+make_sim_swvam_data <- function(df, n_teachers, n_students) {
+  list(
+    N          = nrow(df),
+    I          = n_students,
+    J          = n_teachers,
+    K          = 1L,
+    TT         = max(df$grade),
+    y          = df$y,
+    y_prev     = rep(0.0, nrow(df)),
+    X          = matrix(0.0, nrow(df), 1L),
+    student_id = df$student_id,
+    teacher_id = df$teacher_id,
+    time_id    = df$grade
+  )
+}
+
+make_sim_composite_data <- function(df, n_teachers, n_students, teacher_school) {
+
+  # Peer achievement — mean score per school-grade
+  df <- df |>
+    group_by(school_id, grade) |>
+    mutate(P = mean(y)) |>
+    ungroup()
+
+  # School covariate — school membership as single column
+  S <- matrix(as.numeric(teacher_school), ncol = 1)
+
+  list(
+    N          = nrow(df),
+    I          = n_students,
+    J          = n_teachers,
+    K          = 1L,
+    L          = 1L,
+    TT         = max(df$grade),
+    y          = df$y,
+    y_prev     = rep(0.0, nrow(df)),
+    P          = df$P,
+    X          = matrix(0.0, nrow(df), 1L),
+    S          = S,
+    student_id = df$student_id,
+    teacher_id = df$teacher_id,
+    time_id    = df$grade
+  )
+}
+
+# ── Add to data builders chunk ─────────────────────────────────────────────
+make_sim_tvaas_data <- function(df, n_teachers, n_students, n_grades) {
+
+  Y_wide <- df |>
+    arrange(student_id, grade) |>
+    pivot_wider(
+      id_cols      = student_id,
+      names_from   = grade,
+      values_from  = y,
+      names_prefix = "grade_"
+    ) |>
+    arrange(student_id) |>
+    dplyr::select(-student_id) |>
+    as.matrix()
+
+  T_wide <- df |>
+    arrange(student_id, grade) |>
+    pivot_wider(
+      id_cols      = student_id,
+      names_from   = grade,
+      values_from  = teacher_id,
+      names_prefix = "grade_"
+    ) |>
+    arrange(student_id) |>
+    dplyr::select(-student_id) |>
+    as.matrix()
+
+  obs_mask  <- matrix(1L, nrow = n_students, ncol = n_grades)
+  n_obs_vec <- rep(n_grades, n_students)
+
+  list(
+    N          = n_students,
+    J          = n_teachers,
+    G          = n_grades,
+    Y          = Y_wide,
+    obs        = obs_mask,
+    n_obs      = n_obs_vec,
+    teacher_id = T_wide
+  )
+}
+```
+
+---
+
+## 3. Recovery metrics
+
+```{r metrics}
+evaluate_recovery <- function(theta_estimated, theta_true) {
+  # Correlation with true teacher quality
+  r <- cor(theta_estimated, theta_true, use = "complete.obs")
+
+  # Proportion correctly assigned to quality quartile (Kim Table 2)
+  q_breaks_true <- quantile(theta_true,      probs = 0:4 / 4)
+  q_breaks_est  <- quantile(theta_estimated, probs = 0:4 / 4)
+
+  true_q <- cut(theta_true,      breaks = q_breaks_true,
+                labels = 1:4, include.lowest = TRUE)
+  est_q  <- cut(theta_estimated, breaks = q_breaks_est,
+                labels = 1:4, include.lowest = TRUE)
+
+  pct_correct <- mean(true_q == est_q, na.rm = TRUE)
+
+  list(correlation = round(r, 4), pct_correct_quartile = round(pct_correct, 4))
+}
+```
+
+---
+
+## 4. Load compiled models
+
+```{r load_models}
+# Compile once — reuses cached executables on subsequent runs
+mod_cva   <- cmdstan_model("cva_model.stan")
+mod_swvam <- cmdstan_model("swvam_model.stan")
+mod_composite <- cmdstan_model("composite_model.stan")
+mod_tvaas <- cmdstan_model("tvaas_model.stan")
+```
+
+---
+
+## 5. Single-trial runner
+
+```{r single_trial}
+run_trial <- function(scenario, n_grades, n_teachers = 20,
+                      n_students = 200, n_schools = 4, 
+                      rho = 0.7, seed = 1L) {
+
+  sim <- simulate_data(
+    n_teachers = n_teachers,
+    n_students = n_students,
+    n_grades   = n_grades,
+    n_schools  = n_schools,
+    scenario   = scenario,
+    rho        = rho,
+    seed       = seed
+  )
+
+  # ── Fit CVA ───────────────────────────────────────────────────────────────
+  fit_cva <- mod_cva$sample(
+    data          = make_sim_cva_data(sim$data, n_teachers),
+    seed          = seed, chains = 1,
+    iter_warmup   = 500,
+    iter_sampling = 1000,
+    refresh = 0, show_messages = FALSE
+  )
+  theta_cva <- fit_cva$summary("theta")$mean
+  if (sd(theta_cva) < 1e-6) return(NULL)
+
+  # ── Fit SWVAM ─────────────────────────────────────────────────────────────
+  fit_swvam <- mod_swvam$sample(
+    data          = make_sim_swvam_data(sim$data, n_teachers, n_students),
+    seed          = seed, chains = 1,
+    iter_warmup   = 500,
+    iter_sampling = 1000,
+    refresh = 0, show_messages = FALSE
+  )
+  theta_swvam <- fit_swvam$summary("theta")$mean
+  if (sd(theta_swvam) < 1e-6) return(NULL)
+
+  # ── Fit Composite ─────────────────────────────────────────────────────────
+  fit_comp <- mod_composite$sample(
+  data = make_sim_composite_data(sim$data, n_teachers, 
+                                 n_students, sim$teacher_school),
+    seed          = seed, chains = 1,
+    iter_warmup   = 500,
+    iter_sampling = 1000,
+    refresh = 0, show_messages = FALSE
+  )
+  theta_comp <- fit_comp$summary("theta")$mean
+  if (sd(theta_comp) < 1e-6) return(NULL)
+    # ── Fit TVAAS ─────────────────────────────────────────────────────────────
+  fit_tvaas <- mod_tvaas$sample(
+    data          = make_sim_tvaas_data(sim$data, n_teachers,
+                                        n_students, n_grades),
+    seed          = seed, chains = 1,
+    iter_warmup   = 500,
+    iter_sampling = 1000,
+    refresh       = 0, show_messages = FALSE
+  )
+
+  if (any(fit_tvaas$diagnostic_summary()$ebfmi < 0.3)) return(NULL)
+
+  theta_tvaas <- fit_tvaas$summary("theta")$mean
+  if (sd(theta_tvaas) < 1e-6) return(NULL)
+
+  # ── Save theta summaries ───────────────────────────────────────────────────
+  extract_theta <- function(fit) {
+    fit$summary("theta", mean, sd, ~quantile(.x, c(0.05, 0.95))) |>
+      rename(mean = mean, sd = sd, q05 = `5%`, q95 = `95%`)
+  }
+
+  saveRDS(
+    list(
+      scenario   = scenario,
+      n_grades   = n_grades,
+      seed       = seed,
+      theta_true = sim$theta_true,
+      cva        = extract_theta(fit_cva),
+      swvam      = extract_theta(fit_swvam),
+      composite  = extract_theta(fit_comp),
+      tvaas      = extract_theta(fit_tvaas)
+    ),
+    sprintf("stan_fits/thetas_%s_g%d_seed%d.rds", scenario, n_grades, seed)
+  )
+
+  # ── Evaluate ──────────────────────────────────────────────────────────────
+  rec_cva   <- evaluate_recovery(theta_cva,   sim$theta_true)
+  rec_swvam <- evaluate_recovery(theta_swvam, sim$theta_true)
+  rec_comp  <- evaluate_recovery(theta_comp,  sim$theta_true)
+  rec_tvaas <- evaluate_recovery(theta_tvaas, sim$theta_true)
+  
+    tibble(
+    scenario  = scenario,
+    n_grades  = n_grades,
+    trial     = seed,
+    cor_cva   = rec_cva$correlation,
+    cor_swvam = rec_swvam$correlation,
+    cor_comp  = rec_comp$correlation,
+    cor_tvaas = rec_tvaas$correlation,
+    pct_cva   = rec_cva$pct_correct_quartile,
+    pct_swvam = rec_swvam$pct_correct_quartile,
+    pct_comp  = rec_comp$pct_correct_quartile,
+    pct_tvaas = rec_tvaas$pct_correct_quartile,
+    swvam_minus_cva_cor  = rec_swvam$correlation          - rec_cva$correlation,
+    comp_minus_cva_cor   = rec_comp$correlation           - rec_cva$correlation,
+    tvaas_minus_cva_cor  = rec_tvaas$correlation          - rec_cva$correlation,
+    swvam_minus_cva_pct  = rec_swvam$pct_correct_quartile - rec_cva$pct_correct_quartile,
+    comp_minus_cva_pct   = rec_comp$pct_correct_quartile  - rec_cva$pct_correct_quartile,
+    tvaas_minus_cva_pct  = rec_tvaas$pct_correct_quartile - rec_cva$pct_correct_quartile
+  )
+}
+```
+
+---
+
+## 6. Full simulation study
+
+Runs 25 trials per scenario × grade combination (reduced from Kim's 100 for
+computational feasibility; increase `n_trials` for final results).
+
+```{r run_simulation, cache=TRUE}
+N_TRIALS  <- 100
+SCENARIOS <- c("A", "C")  
+GRADES    <- c(2L, 4L, 6L)
+
+all_results <- list()
+
+for (sc in SCENARIOS) {
+  for (ng in GRADES) {
+    message(sprintf("Running scenario %s, %d grades...", sc, ng))
+
+    trial_results <- vector("list", N_TRIALS)
+    valid_trials  <- 0L
+    seed          <- 1L
+
+    while (valid_trials < N_TRIALS) {
+      result <- tryCatch(
+        run_trial(scenario = sc, n_grades = ng, seed = seed),
+        error = function(e) NULL
+      )
+      if (!is.null(result)) {
+        valid_trials <- valid_trials + 1L
+        trial_results[[valid_trials]] <- result
+      }
+      seed <- seed + 1L
+    }
+
+    all_results[[paste(sc, ng)]] <- bind_rows(trial_results)
+    
+    # Save after each scenario-grade combination completes
+    results_df <- bind_rows(all_results)
+    saveRDS(results_df, "simulation_results.rds")
+    message(sprintf("  Saved. Seeds used: %d", seed - 1L))
+  }
+}
+
+results_df <- bind_rows(all_results)
+saveRDS(results_df, "simulation_results.rds")
+```
+
+
+```{r}
+results_df <- readRDS("simulation_results.rds")
+results_df |> count(scenario, n_grades)
+```
+
+---
+
+## 7. Results tables (replicating Kim Tables 2 & 3)
+
+```{r results_tables}
+results_df |>
+  pivot_longer(
+    cols = c(swvam_minus_cva_cor, comp_minus_cva_cor, tvaas_minus_cva_cor,
+         swvam_minus_cva_pct, comp_minus_cva_pct, tvaas_minus_cva_pct),
+    names_to  = "series",
+    values_to = "advantage"
+  ) |>
+  mutate(
+    metric   = if_else(str_detect(series, "cor"),
+                       "Correlation with true θ",
+                       "Proportion correct quartile"),
+    model = case_when(
+  str_detect(series, "swvam") ~ "SWVAM",
+  str_detect(series, "comp")  ~ "Composite",
+  str_detect(series, "tvaas") ~ "TVAAS"
+),
+    scenario = recode(scenario,
+                      A = "A: Invariant",
+                      B = "B: Identical",
+                      C = "C: Random")
+  ) |>
+  ggplot(aes(x = factor(n_grades), y = advantage, fill = model)) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             colour = "grey50", linewidth = 0.4) +
+  geom_boxplot(
+    alpha         = 0.7,
+    outlier.size  = 0.8,
+    outlier.alpha = 0.5,
+    position      = position_dodge(width = 0.75),
+    linewidth     = 0.4
+  ) +
+  facet_grid(scenario ~ metric) +
+  scale_fill_manual(values = c(
+  "SWVAM"     = "#1D9E75",
+  "Composite" = "#D85A30",
+  "TVAAS"     = "#7F77DD"
+)) +
+  labs(
+    title    = "Model advantage over CVA across simulation scenarios",
+    subtitle = "Positive = model better than CVA; negative = CVA better",
+    x        = "Grades of observation per student",
+    y        = "Model minus CVA",
+    fill     = "Model"
+  ) +
+  theme_minimal(base_size = 11) +
+ # Add these to your theme() call to polish it up
+theme(
+  panel.grid.minor  = element_blank(),
+  strip.text.x      = element_text(face = "bold"),
+  strip.text.y      = element_text(face = "bold", angle = 0),  # readable row labels
+  legend.position   = "bottom",                                 # move legend below
+  panel.spacing     = unit(0.8, "lines")                        # more breathing room
+)
+    
+```
+```{r}
+results_df |> 
+  group_by(scenario, n_grades) |>
+  summarise(mean(comp_minus_cva_cor), sd(comp_minus_cva_cor))
+```
+```{r}
+# How often does composite actually beat CVA?
+results_df |>
+  group_by(scenario, n_grades) |>
+  summarise(
+    pct_comp_beats_cva = mean(comp_minus_cva_cor > 0),
+    pct_tvaas_beats_cva = mean(tvaas_minus_cva_cor > 0)
+  )
+```
+
+---
+
+## 8. Visualisation
+
+```{r plot_results, fig.width=10, fig.height=5}
+results_df |>
+  pivot_longer(
+    cols      = c(swvam_minus_cva_cor, swvam_minus_cva_pct),
+    names_to  = "metric",
+    values_to = "swvam_advantage"
+  ) |>
+  mutate(
+    metric   = recode(metric,
+                      swvam_minus_cva_cor = "Correlation with true θ",
+                      swvam_minus_cva_pct = "Proportion correct quartile"),
+    scenario = recode(scenario,
+                      A = "A: Invariant\n(favours SWVAM)",
+                      B = "B: Identical\n(favours CVA)",
+                      C = "C: Random\n(neither)")
+  ) |>
+  ggplot(aes(x = factor(n_grades), y = swvam_advantage, fill = scenario)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.8) +
+  facet_wrap(~ metric) +
+  scale_fill_manual(values = c(
+    "A: Invariant\n(favours SWVAM)" = "#1D9E75",
+    "B: Identical\n(favours CVA)"   = "#378ADD",
+    "C: Random\n(neither)"          = "#7F77DD"
+  )) +
+  labs(
+    title    = "SWVAM advantage over CVA across simulation scenarios",
+    subtitle = "Positive values = SWVAM better; negative = CVA better",
+    x        = "Grades of observation per student",
+    y        = "SWVAM minus CVA",
+    fill     = "Scenario"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+```{r}
+RHO_VALUES <- c(0.3, 0.5, 0.7, 0.9)
+N_TRIALS_RHO <- 25
+SCENARIOS_RHO <- c("A", "C")
+GRADES_RHO <- c(2L, 4L, 6L)
+
+rho_results <- list()
+
+for (rho_val in RHO_VALUES) {
+  for (sc in SCENARIOS_RHO) {
+    for (ng in GRADES_RHO) {
+      message(sprintf("rho=%.1f, scenario=%s, grades=%d", rho_val, sc, ng))
+      
+      trial_results <- vector("list", N_TRIALS_RHO)
+      valid_trials <- 0L
+      seed <- 1L
+      
+      while (valid_trials < N_TRIALS_RHO) {
+        result <- tryCatch(
+          run_trial(scenario = sc, n_grades = ng,
+                    n_teachers = 20, n_students = 200,
+                    n_schools = 4, rho = rho_val, seed = seed),
+          error = function(e) NULL
+        )
+        if (!is.null(result)) {
+          result$rho <- rho_val
+          valid_trials <- valid_trials + 1L
+          trial_results[[valid_trials]] <- result
+        }
+        seed <- seed + 1L
+      }
+      
+      rho_results[[paste(rho_val, sc, ng)]] <- bind_rows(trial_results)
+      rho_df <- bind_rows(rho_results)
+      saveRDS(rho_df, "rho_sensitivity_results.rds")
+    }
+  }
+}
+```
+
+```{r}
+rho_df <- readRDS("rho_sensitivity_results.rds")
+rho_df |> count(rho, scenario, n_grades)
+```
+
+
+
+
+```{r}
+rho_df |>
+  group_by(rho, scenario, n_grades) |>
+  summarise(
+    mean_tvaas = mean(tvaas_minus_cva_cor),
+    mean_comp  = mean(comp_minus_cva_cor),
+    .groups = "drop"
+  ) |>
+  pivot_longer(cols = c(mean_tvaas, mean_comp),
+               names_to = "model", values_to = "advantage") |>
+  mutate(
+    model    = recode(model, mean_tvaas = "TVAAS", mean_comp = "Composite"),
+    scenario = recode(scenario, A = "A: Invariant", C = "C: Random")
+  ) |>
+  ggplot(aes(x = rho, y = advantage, color = model)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  facet_grid(scenario ~ n_grades) +
+  labs(
+    title    = "Model advantage over CVA by AR(1) correlation strength",
+    subtitle = "Positive = model better than CVA",
+    x        = "Rho (AR(1) correlation)",
+    y        = "Model minus CVA correlation with true θ"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+```{r}
+rho_df |>
+  group_by(rho, scenario, n_grades) |>
+  summarise(
+    mean_tvaas = mean(tvaas_minus_cva_cor),
+    se_tvaas   = sd(tvaas_minus_cva_cor) / sqrt(n()),
+    .groups = "drop"
+  ) |>
+  mutate(scenario = recode(scenario, A = "A: Invariant", C = "C: Random")) |>
+  ggplot(aes(x = rho, y = mean_tvaas, color = factor(n_grades))) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(aes(ymin = mean_tvaas - se_tvaas,
+                  ymax = mean_tvaas + se_tvaas,
+                  fill = factor(n_grades)), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 0.7, linetype = "dotted", 
+             colour = "grey30", linewidth = 0.5) +
+  annotate("text", x = 0.72, y = -0.01, 
+           label = "ECLS-K rho ≈ 0.7", hjust = 0, size = 3) +
+  facet_wrap(~ scenario) +
+  scale_color_manual(values = c("2" = "#378ADD", "4" = "#1D9E75", "6" = "#D85A30")) +
+  scale_fill_manual(values  = c("2" = "#378ADD", "4" = "#1D9E75", "6" = "#D85A30")) +
+  labs(
+    title    = "TVAAS advantage over CVA scales with AR(1) correlation",
+    subtitle = "Shaded regions = ±1 SE across 25 trials",
+    x        = "Rho (AR(1) correlation)",
+    y        = "TVAAS minus CVA (correlation with true θ)",
+    color    = "Grades",
+    fill     = "Grades"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position  = "bottom")
+```
+
+
+
+

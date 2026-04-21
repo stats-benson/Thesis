@@ -1,0 +1,1068 @@
+---
+title: "Testing Area"
+author: "Jacob Benson" 
+header-includes:
+  - \usepackage{float}
+  - \floatplacement{figure}{H}
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE,message=FALSE,warning=FALSE, fig.align = 'center', out.width="80%" )
+library(dplyr)
+library(ggplot2)
+library(mosaic)
+library(tidyr)
+library(emmeans)  
+library(nlme)
+library(lmtest)
+library(GGally)
+library(patchwork)
+library(broom.mixed)
+library(knitr)
+library(kableExtra)
+library(rstan)
+library(lme4)
+library(lattice)
+library(haven)
+library(lmerTest)    # p-values for lmer models
+library(Matrix)      # sparse matrix operations
+library(tibble)
+```
+
+# Loads in the MASSIVE DATASET
+
+
+comparison between a different teacher evaluation metric, deficiencies of 
+
+
+
+
+
+Data obtained from : 
+
+```{r}
+edu_data <- read_sas("~/Stats/Thesis/ECLSK_1998-99_v1_0_SAS_Datasets/eclsk_98_99_k8_child_v1_0.sas7bdat")
+
+```
+
+```{r}
+edu_subset <- edu_data %>%
+  select(
+    # Identifiers
+    CHILDID, 
+    T4_ID, 
+    S4_ID,
+    post_test = C4R4RSCL,
+    pre_test = C2R4RSCL,
+    ses    = WKSESL,
+    race   = RACE,
+    gender = GENDER,
+    age_k     = R2_KAGE,
+    age_g1    = R4AGE,
+    weight = C24CW0
+  )%>%
+  filter(!is.na(post_test), !is.na(T4_ID))
+
+```
+
+```{r}
+# prints all column names containing "AGE"
+names(edu_data)[grep("YEAR", names(edu_data), ignore.case = TRUE)]
+
+```
+
+
+Students within teacher random effects 
+
+```{r}
+vam_model <- lmer(post_test ~ pre_test + ses + race + gender + age_k + age_g1 + (1 | T4_ID), 
+                  data = edu_subset,
+                  weights = weight,
+                  REML = TRUE)
+summary(vam_model)
+teacher_effects <- ranef(vam_model)$T4_ID
+head(teacher_effects[order(teacher_effects$`(Intercept)`, decreasing = TRUE), , drop = FALSE])
+
+```
+
+Student within Teacher within School 
+
+
+```{r}
+vam_model_nested <- lmer(post_test ~ pre_test + ses + race + gender + age_k + age_g1 + (1 | S4_ID/T4_ID), 
+                         data = edu_subset,
+                         weights = weight)
+summary(vam_model_nested)
+```
+
+```{r}
+
+dotplot(ranef(vam_model, condVar = TRUE))
+```
+
+Signal weighted:
+
+$$y_{ijt} \sim N(\alpha_i\theta_j, \frac{1}{a_i})$$
+Where:
+
+$\alpha_i$ : Student Reliability
+$\theta_j$ : Teacher Effect
+$a_i$ : Student Sensitivity (how responsive they are to the teacher)
+
+
+
+```{r}
+# Create integer IDs for Stan
+edu_subset$student_idx <- as.integer(as.factor(edu_subset$CHILDID))
+edu_subset$teacher_idx <- as.integer(as.factor(edu_subset$T4_ID))
+
+stan_data <- list(
+  N = nrow(edu_subset),
+  S = length(unique(edu_subset$CHILDID)),
+  T = length(unique(edu_subset$T4_ID)),
+  student_id = edu_subset$student_idx,
+  teacher_id = edu_subset$teacher_idx,
+  y = edu_subset$post_test,
+  # Add other covariates (pre-test, SES, etc.) as a matrix if needed
+  x = as.matrix(edu_subset[, c("pre_test", "ses")]) 
+)
+```
+
+
+
+
+
+
+# Full Analysis: 
+
+
+TVAAS stands for Tennessee Value-Added Assessment System.
+
+
+It was developed by William Sanders and colleagues at the University of Tennessee in the late 1980s and became operational statewide in Tennessee in 1992. It was the first large-scale operational VAM system in the US and is what put value-added modeling on the map for education policy.
+A few things made it notable:
+
+
+
+Substantively — Sanders used it to argue that teachers were the single most important school-level factor in student achievement, and that the effects of having a highly effective vs. ineffective teacher were large and cumulative. That finding drove enormous interest from policymakers.
+
+
+Methodologically — the layered model was his solution to the cross-classification problem. Rather than the simpler gain score or covariate adjustment approaches that were common at the time, he built a model that kept all prior teachers in the equation simultaneously. That was genuinely innovative for the early 1990s.
+
+
+Politically — Tennessee's adoption of TVAAS for teacher evaluation made it one of the most controversial systems in education policy. It was later adopted or adapted by other states and became central to federal Race to the Top funding debates around 2009-2012, where states were incentivized to use student test scores in teacher evaluations.
+The McCaffrey et al. paper you're working from is essentially a formal statistical examination of whether Sanders' model actually does what he claimed — and whether its assumptions hold up. That's why the General Model's ability to estimate α\alpha
+α rather than assuming it equals 1 is such a direct challenge to the core TVAAS assumption.
+
+
+
+Load Data: 
+
+```{r}
+raw <- read_sas("~/Stats/Thesis/ECLSK_1998-99_v1_0_SAS_Datasets/eclsk_98_99_k8_child_v1_0.sas7bdat") 
+```
+
+
+
+# ECLS-K restricted-use data come as SAS transport files or fixed-width .dat
+# Public-use data are available as SPSS or SAS files from NCES.
+#
+# Key variables we need (ECLS-K variable names shown):
+#   CHILDID    - unique child identifier
+#   S*TCHID    - teacher ID per round (e.g., S2TCHID = grade 1 teacher)
+#   S*SCHID    - school ID per round
+#   C*R4MSCL   - math IRT scale score per round (or reading: C*R4RSCL)
+#   WKSESL     - SES composite (continuous)
+#   GENDER     - child gender (1=male, 2=female)
+#   RACE       - race/ethnicity (categorical)
+#   P*FREELUN  - free/reduced lunch eligibility (binary)
+#   WKMOMED    - mother's education level
+
+
+
+
+
+
+# --- 1b. Select & rename key variables --------------------------------------
+# ECLS-K has many hundreds of variables. We pull just what we need.
+# Wave labels:  K=kindergarten, G1=1st grade, G3=3rd, G5=5th, G8=8th
+# Round codes in variable names: 1=fall-K, 2=spring-K, 3=fall-1st,
+#   4=spring-1st, 5=spring-3rd, 6=spring-5th, 7=spring-8th
+
+
+```{r}
+
+
+eclsk <- raw %>%
+  select(
+    student_id  = CHILDID,
+
+    # Math IRT scale scores
+    score_fk    = C1R4MSCL,   # Fall Kindergarten  (round 1)
+    score_sk    = C2R4MSCL,   # Spring Kindergarten (round 2)
+    score_g1    = C4R4MSCL,   # Spring 1st grade   (round 4)
+    score_g3    = C5R4MSCL,   # Spring 3rd grade   (round 5)
+    score_g5    = C6R4MSCL,   # Spring 5th grade   (round 6)
+    score_g8    = C7R4MSCL,   # Spring 8th grade   (round 7)
+
+    # Teacher IDs (T{round}_ID)
+    teacher_fk  = T1_ID,      # Fall-K teacher
+    teacher_sk  = T2_ID,      # Spring-K teacher
+    teacher_g1  = T4_ID,      # 1st grade teacher
+    teacher_g3  = T5_ID,      # 3rd grade teacher
+    # Note: T6_ID / T7_ID not present in this file — no linked teacher for G5/G8
+
+    # School IDs (S{round}_ID)
+    school_fk   = S1_ID,
+    school_sk   = S2_ID,
+    school_g1   = S4_ID,
+    school_g3   = S5_ID,
+    school_g5   = S6_ID,
+
+    # Student-level covariates
+    ses         = WKSESL,     # SES composite (continuous, ~standardized)
+    gender      = GENDER,     # 1=male, 2=female
+    raceth      = WKRACETH,   # race/ethnicity composite
+    mom_ed      = WKMOMED,    # mother's education (ordinal)
+    poverty     = WKPOV_R     # poverty ratio (continuous)
+  ) %>%
+  mutate(
+    # Binary demographic indicators
+    female    = if_else(gender  == 2, 1L, 0L),
+    black     = if_else(raceth  == 3, 1L, 0L),  # WKRACETH: 3=Black non-Hispanic
+    hispanic  = if_else(raceth  == 5, 1L, 0L),  # 5=Hispanic
+    asian     = if_else(raceth  == 2, 1L, 0L),  # 2=Asian non-Hispanic
+    # Poverty flag: below poverty line = WKPOV_R <= 1.0
+    low_inc   = if_else(poverty <= 1, 1L, 0L),
+    # Make IDs character to prevent accidental numeric math on IDs
+    across(c(student_id,
+             teacher_fk, teacher_sk, teacher_g1, teacher_g3,
+             school_fk, school_sk, school_g1, school_g3, school_g5),
+           as.character)
+  )
+
+```
+
+
+
+
+```{r}
+# --- 1c. Recode missing values ----------------------------------------------
+# ECLS-K uses negative codes for missing (-1, -7, -8, -9)
+eclsk <- eclsk %>%
+  mutate(across(where(is.numeric), ~ if_else(. < 0, NA_real_, .)))
+
+```
+
+
+
+
+```{r}
+# --- 1d. Create analytic sample ---------------------------------------------
+# For the core VAM models we focus on students with 3 linked years of data
+# (1st, 3rd, 5th grade) to match the paper's 4-grade structure.
+# Adjust years_required if you want a different window.
+
+analytic <- eclsk %>%
+  filter(
+    !is.na(score_sk),     # spring-K baseline score
+    !is.na(score_g1),     # 1st grade score
+    !is.na(score_g3),     # 3rd grade score
+    !is.na(teacher_sk),   # spring-K teacher
+    !is.na(teacher_g1),   # 1st grade teacher
+    !is.na(teacher_g3)    # 3rd grade teacher
+  )
+
+cat("Analytic sample N:", nrow(analytic), "\n")
+cat("Unique K teachers:", n_distinct(analytic$teacher_sk), "\n")
+cat("Unique G1 teachers:", n_distinct(analytic$teacher_g1), "\n")
+cat("Unique G3 teachers:", n_distinct(analytic$teacher_g3), "\n")
+```
+
+
+# --- 1e. Reshape to long format (needed for CC and Layered models) ----------
+# Three time points: spring-K (g=0), 1st grade (g=1), 3rd grade (g=2)
+
+```{r}
+long <- analytic %>%
+  select(student_id, ses, female, black, hispanic, asian, low_inc, mom_ed,
+         score_sk, score_g1, score_g3,
+         teacher_sk, teacher_g1, teacher_g3,
+         school_sk, school_g1, school_g3) %>%
+  pivot_longer(
+    cols      = c(score_sk, score_g1, score_g3),
+    names_to  = "grade_label",
+    values_to = "score"
+  ) %>%
+  mutate(
+    grade = case_when(
+      grade_label == "score_sk" ~ 0,   # spring-K  = time 0
+      grade_label == "score_g1" ~ 1,   # 1st grade = time 1
+      grade_label == "score_g3" ~ 2    # 3rd grade = time 2
+    ),
+    teacher = case_when(
+      grade == 0 ~ teacher_sk,
+      grade == 1 ~ teacher_g1,
+      grade == 2 ~ teacher_g3
+    ),
+    school = case_when(
+      grade == 0 ~ school_sk,
+      grade == 1 ~ school_g1,
+      grade == 2 ~ school_g3
+    )
+  ) %>%
+  select(-grade_label, -starts_with("teacher_"), -starts_with("school_"))
+```
+
+
+
+
+```{r}
+# Compute gain scores (for gain score model)
+gains <- analytic %>%
+  mutate(
+    gain_sk_to_g1 = score_g1 - score_sk,   # K -> 1st
+    gain_g1_to_g3 = score_g3 - score_g1    # 1st -> 3rd
+  )
+
+```
+
+
+
+
+
+
+```{r}
+cat("\n--- Descriptive Statistics ---\n")
+analytic %>%
+  select(score_sk, score_g1, score_g3, ses, female, low_inc, mom_ed) %>%
+  summary() %>%
+  print()
+
+# Score distributions by grade
+long %>%
+  mutate(grade_label = factor(grade, labels = c("Spring-K", "1st Grade", "3rd Grade"))) %>%
+  ggplot(aes(x = score, fill = grade_label)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Math Score Distribution by Grade (ECLS-K)",
+       x = "IRT Scale Score", fill = "Grade") +
+  theme_minimal()
+
+```
+
+```{r}
+
+# =============================================================================
+# SECTION 3: MODEL FITTING
+# =============================================================================
+# We use grades 1, 3, and 5 as our three time points (g=0,1,2 in paper notation)
+# g0 = 1st grade, g1 = 3rd grade, g2 = 5th grade
+#
+# Covariate vector (xi): ses, female, black, hispanic, asian, frl
+# Teacher effect: random intercept per teacher per grade (phi_ig * theta_g)
+# School effect:  random intercept per school per grade (lambda_ig * eta_g)
+# =============================================================================
+
+covariates <- "ses + female + black + hispanic + asian + low_inc + mom_ed"
+
+```
+
+
+
+
+Model 1: Covariate Adjustment Model
+
+$$y_{ig} = \mu_g + \beta_gx_i + \gamma^*y_{i,g-1} +\theta_j+ \eta_k + \epsilon_ig$$
+
+
+Where: 
+$y_{ig}$ - Student i's score in grade g
+$\mu_g$ - overall mean for grade g
+$\beta_gx_i$ - effect of student covariates (all demographics...)
+$\gamma^*y_{i,g-1}$ - effect of prior score 
+$\eta_k$ - random effect of school k 
+$\epsilon_ig$ - leftover residual error
+ 
+Assumes residuals are independent across grades. 
+prior score serves as a covariate
+
+$\theta_j$ - random effect of teacher j
+
+
+
+In the general model, the score at grade g
+g includes contributions from
+all prior teachers, scaled by alpha:
+
+α parameters control how much of a prior teacher's effect
+persists into the current score. So:
+
+```{r}
+cat("\n=== MODEL 1: COVARIATE ADJUSTMENT ===\n")
+
+# Spring-K -> 1st grade
+formula_cov_g1 <- as.formula(paste(
+  "score_g1 ~ score_sk +", covariates, "+ (1 | teacher_g1) + (1 | school_g1)"
+))
+model_cov_g1 <- lmer(formula_cov_g1, data = analytic, REML = FALSE)
+summary(model_cov_g1)
+
+# 1st grade -> 3rd grade
+formula_cov_g3 <- as.formula(paste(
+  "score_g3 ~ score_g1 +", covariates, "+ (1 | teacher_g3) + (1 | school_g3)"
+))
+model_cov_g3 <- lmer(formula_cov_g3, data = analytic, REML = FALSE)
+summary(model_cov_g3)
+
+# Extract teacher BLUPs
+blup_cov_g1 <- ranef(model_cov_g1)$teacher_g1 %>%
+  rownames_to_column("teacher") %>%
+  rename(blup_cov_g1 = `(Intercept)`)
+
+blup_cov_g3 <- ranef(model_cov_g3)$teacher_g3 %>%
+  rownames_to_column("teacher") %>%
+  rename(blup_cov_g3 = `(Intercept)`)
+
+vc_cov_g1 <- as.data.frame(VarCorr(model_cov_g1))
+vc_cov_g3 <- as.data.frame(VarCorr(model_cov_g3))
+cat("Covariate Adj. teacher variance (G1):", vc_cov_g1$vcov[vc_cov_g1$grp == "teacher_g1"], "\n")
+cat("Covariate Adj. teacher variance (G3):", vc_cov_g3$vcov[vc_cov_g3$grp == "teacher_g3"], "\n")
+
+```
+
+
+OUTPUTS:
+
+Teacher effect accounts for about 2.1% of total variation in G1 comparison. The school has a much higher effect of 7.0% of variance. 
+
+
+Key limitation to this model 1: 
+
+Covariate adjustment assumes that residuals across years are independent - students unexplained G1 residual tells you nothing about their G3 residual. Students are individuals and can carry unobserved traits with them that arent captured by the prior score. 
+
+
+
+
+
+Model 2: Gain Score Model 
+
+Instead of controlling for prior achievement, we are looking at the difference in achievement. 
+
+Makes an assumption that all alpha parameters equal 1, meaning teacher effects from prior years persist completely and forever into future scores. Implicitly saying that the kindergarden teacher effect is carried forward fully into 1st grade. 
+
+$$d_{ig} = \mu_g + \beta_gx_i  +\phi^\prime_{ig}\theta_g+ \lambda^\prime_{ig}\eta_g + \epsilon_{ig}$$
+
+
+Where: 
+$y_{ig}$ - gain score (current - prior)
+$\mu_g$ - mean gain for grade g
+$\beta_gx_i$ - effect of student covariates (all demographics...)
+$\eta_k$ - random effect of school k 
+$\epsilon_{ig}$ - leftover residual error
+ 
+Assumes residuals are independent across grades. 
+prior score serves as a covariate
+
+$\phi^\prime_{ig}\theta_g$ - random effect of teacher for grade g
+
+
+When you take the difference yig−yi,g−1y_{ig} - y_{i,g-1}
+yig​−yi,g−1​ to get the gain score, the prior teacher terms only cancel out cleanly if α=1.
+
+If α<1, there's a leftover piece of the prior teacher's effect still sitting in the gain score that the model doesn't account for — which becomes an omitted variable and can bias your teacher effect estimates.
+
+Residuals assumed independent across grades. 
+
+```{r}
+
+cat("\n=== MODEL 2: GAIN SCORE MODEL ===\n")
+
+# K -> G1 gain
+formula_gain_g1 <- as.formula(paste(
+  "gain_sk_to_g1 ~", covariates, "+ (1 | teacher_g1) + (1 | school_g1)"
+))
+model_gain_g1 <- lmer(formula_gain_g1, data = gains, REML = FALSE)
+summary(model_gain_g1)
+
+# G1 -> G3 gain
+formula_gain_g3 <- as.formula(paste(
+  "gain_g1_to_g3 ~", covariates, "+ (1 | teacher_g3) + (1 | school_g3)"
+))
+model_gain_g3 <- lmer(formula_gain_g3, data = gains, REML = FALSE)
+summary(model_gain_g3)
+
+# Extract BLUPs
+blup_gain_g1 <- ranef(model_gain_g1)$teacher_g1 %>%
+  rownames_to_column("teacher") %>%
+  rename(blup_gain_g1 = `(Intercept)`)
+
+blup_gain_g3 <- ranef(model_gain_g3)$teacher_g3 %>%
+  rownames_to_column("teacher") %>%
+  rename(blup_gain_g3 = `(Intercept)`)
+
+vc_gain_g1 <- as.data.frame(VarCorr(model_gain_g1))
+vc_gain_g3 <- as.data.frame(VarCorr(model_gain_g3))
+cat("Gain Score teacher variance (G1):", vc_gain_g1$vcov[vc_gain_g1$grp == "teacher_g1"], "\n")
+cat("Gain Score teacher variance (G3):", vc_gain_g3$vcov[vc_gain_g3$grp == "teacher_g3"], "\n")
+
+
+```
+
+
+They produce nearly identical teacher variance estimates and BLUP rankings because they're making similarly restrictive assumptions — just in different directions. Model 1 assumes an auto regressive residual structure; Model 2 assumes α=1. Both ignore the correlation in residuals *across years* for the same student. 
+
+
+
+
+
+Model 3: Cross-Classified (CC) Model
+
+$$y_{ig} = \mu_g + \gamma_gi + \mu_i + \gamma_ig  + \sum_{y=0}^g \phi^\prime_{it}\theta_t+ \lambda^\prime_{ig}\eta_g+\epsilon_{ig}$$
+
+Where: 
+$y_{ig}$ - student i's score in grade g
+$\mu_g + \gamma_gi$ - overall linear growth trend
+$\mu_i$ - random student intercept
+$\gamma_ig$ - random student growth slope
+$\sum_{y=0}^g \phi^\prime_{it}\theta_t$ - all prior teacher contribute, (alpha = 1 so no loss of contribution)
+
+
+$\lambda^\prime_{ig} \eta_g$ - school random effect
+
+$\epsilon_{ig}$ - residual 
+
+
+
+All years modeled simultaneously rather than breaking it up into differences between years.
+Prior teachers are fully included, effects fully presist. But explicitly represented rather than expressed as a prior score. 
+
+
+CC model uses a linear growth trajectory, assuming scores grow at a constant rate across grades. 
+
+
+
+
+ 
+
+
+```{r}
+
+
+
+cat("\n=== MODEL 3: CROSS-CLASSIFIED (CC) MODEL ===\n")
+
+cc_data <- long %>%
+  left_join(analytic %>% select(student_id, teacher_sk, teacher_g1, teacher_g3,
+                                school_sk, school_g1, school_g3),
+            by = "student_id") %>%
+  mutate(
+    # time: 0=spring-K, 1=1st grade, 2=3rd grade
+    time = grade
+  )
+
+# CC model: random student intercept + slope, crossed teacher REs per grade
+# Teacher effects from prior grades persist forward (alpha=1 assumption)
+formula_cc <- score ~
+  time +                                              # linear time trend
+  ses + female + black + hispanic + asian + low_inc + mom_ed +
+  (1 | student_id) +                          # random student growth
+  (1 | teacher_sk) +                                 # K teacher (persists all years)
+  (1 | teacher_g1) +                                 # G1 teacher (persists from G1)
+  (1 | teacher_g3) +                                 # G3 teacher effect
+  (1 | school_sk)                                    # school random effect
+
+model_cc <- lmer(formula_cc, data = cc_data, REML = FALSE,
+                 control = lmerControl(optimizer = "bobyqa",
+                                       optCtrl = list(maxfun = 2e5)))
+summary(model_cc)
+
+blup_cc_sk <- ranef(model_cc)$teacher_sk %>%
+  rownames_to_column("teacher") %>% rename(blup_cc_sk = `(Intercept)`)
+blup_cc_g1 <- ranef(model_cc)$teacher_g1 %>%
+  rownames_to_column("teacher") %>% rename(blup_cc_g1 = `(Intercept)`)
+blup_cc_g3 <- ranef(model_cc)$teacher_g3 %>%
+  rownames_to_column("teacher") %>% rename(blup_cc_g3 = `(Intercept)`)
+
+vc_cc <- as.data.frame(VarCorr(model_cc))
+cat("CC model teacher variance (K):", vc_cc$vcov[vc_cc$grp == "teacher_sk"], "\n")
+cat("CC model teacher variance (G1):", vc_cc$vcov[vc_cc$grp == "teacher_g1"], "\n")
+cat("CC model teacher variance (G3):", vc_cc$vcov[vc_cc$grp == "teacher_g3"], "\n")
+
+```
+
+
+Key outputs of model 3:
+
+The CC model attributes slightly less variance to teachers, as the random student intercept is doing work by absorbing stable difference in the individual that are uncontrolled in model 1 or 2 as was just done by prior score. 
+
+
+The largest piece of variance is the student, which tells that who the student is matters more than any other factor in the model. 
+
+Half of all variance in scores is stable student-level differences. Teachers collectively account for about 4.6% — still meaningful, but a very different picture than Models 1 and 2 suggested.
+
+
+G3 teachers show the most variance. This partly reflects that by 3rd grade there's simply more spread in scores to explain, but it also reflects the cross-classified structure — G3 teacher effects are estimated net of whatever K and G1 teachers already contributed, which is a more precise attribution than Models 1 and 2 could achieve.
+
+
+
+
+
+
+
+
+
+# Model 4: TVAAS Layered Model 
+
+
+$$y_{ig} = \mu_g + \beta_gx_i +\sum_{t=0}^g\phi^\prime_{it}\theta_t + \lambda^\prime_{ig}\eta_g+\mu_i+\epsilon_{ig}$$
+
+Where:
+
+$y_{ig}$ - Student i's score in grade g 
+$\mu_g$ - free mean per grade, no linearity constraint 
+$\beta_gx_i$ - student covariates, demographics ...
+$\sum_{t=0}^g\phi^\prime_{it}\theta_t$ - all prior teacher effects, (alpha = 1)
+$\lambda^\prime_{ig}\eta_g$ - school random effect
+$\mu_i$ - student random intercept
+$\epsilon_{ig}$ - residual 
+
+
+Layered model differences, no longer a linear growth for overall mean grade between grades. Now it allows each grade to have its own estimated mean from the data. Slightly more flexible. 
+
+
+No random student slope, meaning students can differ in intercept but are assumed to grow at the same rate. 
+
+an unrestricted covariance structure for the residuals
+
+
+
+
+
+
+
+
+
+```{r}
+
+cat("\n=== MODEL 4: TVAAS LAYERED MODEL ===\n")
+
+layered_data <- cc_data %>%
+  mutate(grade_f = factor(grade, labels = c("K", "G1", "G3")))
+
+formula_layered <- score ~
+  grade_f +                                           # free mean per grade
+  ses + female + black + hispanic + asian + low_inc + mom_ed +
+  (1 | teacher_sk) +                                  # K teacher (alpha=1, persists)
+  (1 | teacher_g1) +                                  # G1 teacher (persists from G1)
+  (1 | teacher_g3) +                                  # G3 teacher effect
+  (1 | student_id) +                                  # student random intercept
+  (1 | school_sk)                                     # school effect
+
+model_layered <- lmer(formula_layered, data = layered_data, REML = FALSE,
+                      control = lmerControl(optimizer = "bobyqa",
+                                            optCtrl = list(maxfun = 2e5)))
+summary(model_layered)
+
+blup_lay_sk <- ranef(model_layered)$teacher_sk %>%
+  rownames_to_column("teacher") %>% rename(blup_lay_sk = `(Intercept)`)
+blup_lay_g1 <- ranef(model_layered)$teacher_g1 %>%
+  rownames_to_column("teacher") %>% rename(blup_lay_g1 = `(Intercept)`)
+blup_lay_g3 <- ranef(model_layered)$teacher_g3 %>%
+  rownames_to_column("teacher") %>% rename(blup_lay_g3 = `(Intercept)`)
+
+vc_lay <- as.data.frame(VarCorr(model_layered))
+cat("Layered teacher variance (K):", vc_lay$vcov[vc_lay$grp == "teacher_sk"], "\n")
+cat("Layered teacher variance (G1):", vc_lay$vcov[vc_lay$grp == "teacher_g1"], "\n")
+cat("Layered teacher variance (G3):", vc_lay$vcov[vc_lay$grp == "teacher_g3"], "\n")
+
+```
+
+AIC comparison:
+
+CC:      151,075.9
+Layered: 149,627.4
+
+
+The big picture so far is that Models 3 and 4 tell essentially the same story about teachers once you account for persistent student differences, but the Layered model does it with better fit and fewer restrictive assumptions about growth trajectories.
+
+The Layered model fits meaningfully better — a difference of about 1,448 AIC points on the same data. That's strong evidence that freeing up the grade means matters. The linearity assumption in CC was doing real damage to model fit.
+
+
+
+# Model 5: The General Model
+
+$$y_{ig} = \mu_g + \beta_g' x_i + \sum_{t=0}^{g-1} \alpha_{gt}\phi_{it}'\theta_t + \phi_{ig}'\theta_g + \lambda_{ig}'\eta_g + \varepsilon_{ig}$$
+
+Big difference between this and other models are estimated alpha parameters, so that teacher effect is not fully kept. 
+
+ParameterMeaningα10\alpha_{10}
+α10​how much of the K teacher effect persists into G1α20\alpha_{20}
+α20​how much of the K teacher effect persists into G3α21\alpha_{21}
+α21​how much of the G1 teacher effect persists into G3
+
+
+In a larger dataset, this would be a full covariance structure. 
+
+The big thing to look at is the alpha estimates to see how close it is to 1 or 0, which would indicate different overarching effects of teachers. 
+
+```{r}
+
+# -----------------------------------------------------------------------------
+# MODEL 5: GENERAL MODEL (alpha estimated correctly)
+# -----------------------------------------------------------------------------
+# Strategy: fit the layered model first (already done), then estimate alpha
+# by regressing each grade's residuals on the prior grade's teacher effects.
+#
+# alpha_gt = Cov(residual_g, teacher_effect_t) / Var(teacher_effect_t)
+#
+# More practically: for each student, compute the fitted teacher contribution
+# from prior grades using the layered BLUPs, then estimate how much of that
+# contribution actually shows up in the current grade's score after removing
+# all other fixed effects.
+# -----------------------------------------------------------------------------
+
+cat("\n=== MODEL 5: GENERAL MODEL (alpha estimated) ===\n")
+
+# Step 1: Get grade-specific means from layered model fixed effects
+mu_sk <- fixef(model_layered)["(Intercept)"]
+mu_g1 <- fixef(model_layered)["(Intercept)"] + fixef(model_layered)["grade_fG1"]
+mu_g3 <- fixef(model_layered)["(Intercept)"] + fixef(model_layered)["grade_fG3"]
+
+# Step 2: Compute covariate-adjusted scores (remove fixed effects from scores)
+# This isolates the part of each score not explained by covariates or grade means
+cov_vars <- c("ses", "female", "black", "hispanic", "asian", "low_inc", "mom_ed")
+
+get_resid <- function(outcome, data) {
+  f <- as.formula(paste(outcome, "~", paste(cov_vars, collapse = " + ")))
+  m <- lm(f, data = data, na.action = na.exclude)
+  residuals(m)
+}
+
+general_data2 <- analytic %>%
+  mutate(
+    resid_sk = get_resid("score_sk", analytic),
+    resid_g1 = get_resid("score_g1", analytic),
+    resid_g3 = get_resid("score_g3", analytic)
+  ) %>%
+  # Attach layered BLUPs for each teacher
+  left_join(blup_lay_sk %>% rename(teacher_sk = teacher), by = "teacher_sk") %>%
+  left_join(blup_lay_g1 %>% rename(teacher_g1 = teacher), by = "teacher_g1") %>%
+  rename(
+    theta_sk = blup_lay_sk,
+    theta_g1 = blup_lay_g1
+  ) %>%
+  mutate(across(c(theta_sk, theta_g1), ~ replace_na(., 0)))
+
+# Step 3: Estimate alpha_10 — how much K teacher effect persists into G1
+# resid_g1 = alpha_10 * theta_sk + teacher_g1_RE + eps
+formula_alpha10 <- resid_g1 ~ theta_sk + (1 | teacher_g1)
+model_alpha10 <- lmer(formula_alpha10, data = general_data2, REML = FALSE)
+alpha_10_est <- fixef(model_alpha10)["theta_sk"]
+cat("Estimated alpha_10 (K teacher -> G1):", round(alpha_10_est, 3), "\n")
+
+# Step 4: Estimate alpha_20 and alpha_21 — persistence into G3
+# resid_g3 = alpha_20 * theta_sk + alpha_21 * theta_g1 + teacher_g3_RE + eps
+formula_alpha_g3 <- resid_g3 ~ theta_sk + theta_g1 + (1 | teacher_g3)
+model_alpha_g3 <- lmer(formula_alpha_g3, data = general_data2, REML = FALSE)
+alpha_20_est <- fixef(model_alpha_g3)["theta_sk"]
+alpha_21_est <- fixef(model_alpha_g3)["theta_g1"]
+cat("Estimated alpha_20 (K teacher -> G3):", round(alpha_20_est, 3), "\n")
+cat("Estimated alpha_21 (G1 teacher -> G3):", round(alpha_21_est, 3), "\n")
+
+# Step 5: Extract G1 and G3 teacher BLUPs from general model
+blup_gen_g1 <- ranef(model_alpha10)$teacher_g1 %>%
+  rownames_to_column("teacher") %>% rename(blup_gen_g1 = `(Intercept)`)
+blup_gen_g3 <- ranef(model_alpha_g3)$teacher_g3 %>%
+  rownames_to_column("teacher") %>% rename(blup_gen_g3 = `(Intercept)`)
+
+vc_gen_g1 <- as.data.frame(VarCorr(model_alpha10))
+vc_gen_g3 <- as.data.frame(VarCorr(model_alpha_g3))
+cat("General Model teacher variance (G1):", vc_gen_g1$vcov[vc_gen_g1$grp == "teacher_g1"], "\n")
+cat("General Model teacher variance (G3):", vc_gen_g3$vcov[vc_gen_g3$grp == "teacher_g3"], "\n")
+
+# Alpha summary table
+alpha_summary <- tibble(
+  Parameter   = c("alpha_10", "alpha_20", "alpha_21"),
+  Description = c("K teacher -> G1", "K teacher -> G3", "G1 teacher -> G3"),
+  Estimate    = c(alpha_10_est, alpha_20_est, alpha_21_est),
+  Layered_assumption = 1.0
+)
+cat("\n--- Alpha persistence estimates ---\n")
+print(alpha_summary)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+
+# =============================================================================
+# SECTION 4: MODEL COMPARISON
+# =============================================================================
+# Compare models on:
+#   (a) Teacher variance components (signal)
+#   (b) Correlation between teacher BLUPs across models (convergent validity)
+#   (c) Model fit (log-likelihood, AIC, BIC)
+# =============================================================================
+
+cat("\n=== MODEL COMPARISON ===\n")
+
+# --- 4a. Teacher variance components ----------------------------------------
+variance_table_g1 <- tibble(
+  Model  = c("Covariate Adj.", "Gain Score", "Cross-Classified", "TVAAS Layered", "General"),
+  Grade  = "G1",
+  Teacher_Variance = c(
+    vc_cov_g1$vcov[vc_cov_g1$grp  == "teacher_g1"],
+    vc_gain_g1$vcov[vc_gain_g1$grp == "teacher_g1"],
+    vc_cc$vcov[vc_cc$grp           == "teacher_g1"],
+    vc_lay$vcov[vc_lay$grp         == "teacher_g1"],
+    vc_gen_g1$vcov[vc_gen_g1$grp   == "teacher_g1"]
+  )
+)
+
+variance_table_g3 <- tibble(
+  Model  = c("Covariate Adj.", "Gain Score", "Cross-Classified", "TVAAS Layered", "General"),
+  Grade  = "G3",
+  Teacher_Variance = c(
+    vc_cov_g3$vcov[vc_cov_g3$grp  == "teacher_g3"],
+    vc_gain_g3$vcov[vc_gain_g3$grp == "teacher_g3"],
+    vc_cc$vcov[vc_cc$grp           == "teacher_g3"],
+    vc_lay$vcov[vc_lay$grp         == "teacher_g3"],
+    vc_gen_g3$vcov[vc_gen_g3$grp   == "teacher_g3"]
+  )
+)
+
+all_variances <- bind_rows(variance_table_g1, variance_table_g3)
+print(all_variances)
+
+ggplot(all_variances, aes(x = Model, y = Teacher_Variance, fill = Grade)) +
+  geom_col(position = "dodge") +
+  labs(title = "Teacher Variance Components by Model and Grade (ECLS-K)",
+       subtitle = "Higher = more variance attributed to teachers",
+       y = "Teacher Random Effect Variance", x = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+```
+
+
+
+
+
+
+```{r}
+
+# --- 4b. BLUP correlations across models ------------------------------------
+blups_g1 <- blup_cov_g1 %>%
+  full_join(blup_gain_g1, by = "teacher") %>%
+  full_join(blup_cc_g1,   by = "teacher") %>%
+  full_join(blup_lay_g1,  by = "teacher") %>%
+  full_join(blup_gen_g1,  by = "teacher")
+
+cat("\nCorrelation of G1 teacher BLUPs across models:\n")
+print(round(cor(blups_g1 %>% select(starts_with("blup")),
+                use = "pairwise.complete.obs"), 3))
+
+blups_g3 <- blup_cov_g3 %>%
+  full_join(blup_gain_g3, by = "teacher") %>%
+  full_join(blup_cc_g3,   by = "teacher") %>%
+  full_join(blup_lay_g3,  by = "teacher") %>%
+  full_join(blup_gen_g3,  by = "teacher")
+
+cat("\nCorrelation of G3 teacher BLUPs across models:\n")
+print(round(cor(blups_g3 %>% select(starts_with("blup")),
+                use = "pairwise.complete.obs"), 3))
+
+```
+
+
+```{r}
+
+# --- 4c. BLUP scatter: Layered vs General -----------------------------------
+blups_g3 %>%
+  ggplot(aes(x = blup_lay_g3, y = blup_gen_g3)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  labs(title = "G3 Teacher BLUPs: Layered Model vs. General Model",
+       subtitle = "Replicates Figure 2 of McCaffrey et al. (2004)",
+       x = "TVAAS Layered Model BLUP", y = "General Model BLUP") +
+  theme_minimal()
+
+```
+
+
+```{r}
+
+# --- 4d. Model fit statistics -----------------------------------------------
+fit_g1 <- tibble(
+  Model  = c("Covariate Adj. (G1)", "Gain Score (G1)", "General (G1)"),
+  LogLik = c(logLik(model_cov_g1)[1], logLik(model_gain_g1)[1], logLik(model_gen_g1)[1]),
+  AIC    = c(AIC(model_cov_g1), AIC(model_gain_g1), AIC(model_gen_g1)),
+  BIC    = c(BIC(model_cov_g1), BIC(model_gain_g1), BIC(model_gen_g1))
+)
+cat("\nModel fit for G1 outcome models:\n")
+print(fit_g1)
+
+fit_g3 <- tibble(
+  Model  = c("Covariate Adj. (G3)", "Gain Score (G3)", "General (G3)"),
+  LogLik = c(logLik(model_cov_g3)[1], logLik(model_gain_g3)[1], logLik(model_gen_g3)[1]),
+  AIC    = c(AIC(model_cov_g3), AIC(model_gain_g3), AIC(model_gen_g3)),
+  BIC    = c(BIC(model_cov_g3), BIC(model_gain_g3), BIC(model_gen_g3))
+)
+cat("\nModel fit for G3 outcome models:\n")
+print(fit_g3)
+
+fit_multi <- tibble(
+  Model  = c("Cross-Classified", "TVAAS Layered"),
+  LogLik = c(logLik(model_cc)[1], logLik(model_layered)[1]),
+  AIC    = c(AIC(model_cc),       AIC(model_layered)),
+  BIC    = c(BIC(model_cc),       BIC(model_layered))
+)
+cat("\nModel fit for multi-year models:\n")
+print(fit_multi)
+```
+
+
+```{r}
+
+# --- 4e. Alpha persistence summary ------------------------------------------
+alpha_summary <- tibble(
+  Parameter   = c("alpha_10", "alpha_20", "alpha_21"),
+  Description = c("K teacher  -> G1 score",
+                  "K teacher  -> G3 score",
+                  "G1 teacher -> G3 score"),
+  Estimate    = c(alpha_10_est, alpha_20_est, alpha_21_est),
+  Layered_assumption = 1.0
+)
+cat("\n--- Alpha (teacher persistence) estimates from General Model ---\n")
+cat("(Layered model assumes all = 1.0; General model estimates freely)\n")
+print(alpha_summary)
+
+cat("\nAIC difference (General G3 vs Layered, positive = General wins):",
+    AIC(model_layered) - AIC(model_gen_g3), "\n")
+
+```
+
+
+
+
+```{r}
+
+# =============================================================================
+# SECTION 5: POSTERIOR PROBABILITY PLOTS (replicates paper Figure 2)
+# =============================================================================
+# For each teacher, compute approximate posterior probability that
+# their true effect > 0, using the BLUP and its standard error.
+# P(theta_j > 0 | data) ~ pnorm(BLUP_j / SE_j)
+# =============================================================================
+
+compute_post_prob <- function(model, grp_name) {
+  blups  <- ranef(model, condVar = TRUE)[[grp_name]]
+  se     <- sqrt(attr(blups, "postVar")[1, 1, ])
+  blup_v <- blups[, 1]
+  prob   <- pnorm(blup_v / se)
+  tibble(teacher = rownames(blups), blup = blup_v, se = se, post_prob = prob)
+}
+
+# G1 posterior probabilities
+pp_layered_g1 <- compute_post_prob(model_layered,  "teacher_g1") %>% rename(pp_layered = post_prob)
+pp_gen_g1     <- compute_post_prob(model_gen_g1,   "teacher_g1") %>% rename(pp_general = post_prob)
+
+pp_g1 <- pp_layered_g1 %>%
+  select(teacher, pp_layered) %>%
+  left_join(pp_gen_g1 %>% select(teacher, pp_general), by = "teacher")
+
+ggplot(pp_g1, aes(x = pp_layered, y = pp_general)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(linetype = "dashed") +
+  labs(title = "Posterior P(teacher effect > 0) — Grade 1 (ECLS-K)",
+       subtitle = "Layered vs. General Model (replicates McCaffrey et al. Fig. 2)",
+       x = "TVAAS Layered Model", y = "General Model") +
+  xlim(0, 1) + ylim(0, 1) +
+  theme_minimal()
+
+# G3 posterior probabilities
+pp_layered_g3 <- compute_post_prob(model_layered,  "teacher_g3") %>% rename(pp_layered = post_prob)
+pp_gen_g3     <- compute_post_prob(model_gen_g3,   "teacher_g3") %>% rename(pp_general = post_prob)
+
+pp_g3 <- pp_layered_g3 %>%
+  select(teacher, pp_layered) %>%
+  left_join(pp_gen_g3 %>% select(teacher, pp_general), by = "teacher")
+
+ggplot(pp_g3, aes(x = pp_layered, y = pp_general)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(linetype = "dashed") +
+  labs(title = "Posterior P(teacher effect > 0) — Grade 3 (ECLS-K)",
+       subtitle = "Layered vs. General Model",
+       x = "TVAAS Layered Model", y = "General Model") +
+  xlim(0, 1) + ylim(0, 1) +
+  theme_minimal()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+Model A — Bayesian General VAM is the McCaffrey et al. model translated into Stan. The key difference from the frequentist version is that instead of getting single point estimates for the alpha parameters, you get full posterior distributions. So rather than "alpha_10 = 0.3", you get "there's a 95% probability alpha_10 is between 0.1 and 0.5". That's much more honest about uncertainty.
+
+
+Model B — SW-VAM adds two student-level parameters from Kim (2022). Each student gets a reliability parameter aia_i
+ai​ — how consistent their scores are across observations — and a sensitivity parameter αi\alpha_i
+αi​ — how strongly their score responds to teacher quality. The traditional VAM assumption is that all students sit at (ai=1,αi=1)(a_i=1, \alpha_i=1)
+(ai​=1,αi​=1). The SW-VAM estimates where each student actually sits, and re-weights teachers accordingly.
+
+
+
+# Signal Weighted VAM
+
+Bayesian implementation
+
+
+```{r}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

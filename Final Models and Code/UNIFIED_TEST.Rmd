@@ -1,0 +1,392 @@
+---
+title: "unified_test"
+output: html_document
+date: "2026-04-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(cmdstanr)
+library(posterior)
+library(MASS) 
+```
+
+
+```{r}
+# Functions needed from simulation doc:
+# - simulate_data()
+# - make_sim_unified_data()  ← new one I just wrote
+# - evaluate_recovery()
+
+# Models needed — already compiled so just load:
+mod_cva      <- cmdstan_model("cva_model.stan")
+mod_composite <- cmdstan_model("composite_model.stan")
+mod_tvaas    <- cmdstan_model("tvaas_model.stan")
+mod_unified  <- cmdstan_model("unified_model.stan")  # ← new
+```
+
+
+```{r}
+simulate_data <- function(
+    n_teachers = 20,
+    n_students = 200,
+    n_grades   = 3,
+    n_schools  = 4,
+    scenario   = "A",
+    rho        = 0.7,
+    seed       = 141229
+) {
+  set.seed(seed)
+
+  # ── True effects ────────────────────────────────────────────────────────────
+  theta_true     <- rnorm(n_teachers)
+  school_effects <- rnorm(n_schools, 0, 0.3)
+
+  # ── School assignments ──────────────────────────────────────────────────────
+  # Teachers evenly distributed across schools
+  teacher_school <- rep(1:n_schools, length.out = n_teachers)
+
+  # Students evenly distributed across schools
+  student_school <- rep(1:n_schools, length.out = n_students)
+
+  # ── Student-teacher assignments (within school) ─────────────────────────────
+  assign_one_grade <- function() {
+    assignment <- integer(n_students)
+    for (s in 1:n_schools) {
+      school_students <- which(student_school == s)
+      school_teachers <- which(teacher_school == s)
+      assignment[school_students] <- sample(
+        rep(school_teachers, length.out = length(school_students))
+      )
+    }
+    assignment
+  }
+
+  teacher_assign <- matrix(
+    replicate(n_grades, assign_one_grade()),
+    nrow = n_students, ncol = n_grades
+  )
+
+  # ── Student parameters ──────────────────────────────────────────────────────
+  if (scenario == "A") {
+    # Each student has own params, stable across grades
+    alpha_i   <- rlnorm(n_students, log(0.2), log(2) / 2)
+    a_i       <- rlnorm(n_students, log(1.0), log(2) / 2)
+    alpha_mat <- matrix(rep(alpha_i, n_grades), nrow = n_students)
+    a_mat     <- matrix(rep(a_i,     n_grades), nrow = n_students)
+
+  } else if (scenario == "B") {
+    # All students share one set of parameters
+    alpha_shared <- rlnorm(1, log(0.2), log(2) / 2)
+    a_shared     <- rlnorm(1, log(1.0), log(2) / 2)
+    alpha_mat    <- matrix(alpha_shared, nrow = n_students, ncol = n_grades)
+    a_mat        <- matrix(a_shared,     nrow = n_students, ncol = n_grades)
+
+  } else if (scenario == "C") {
+    # New params drawn for every student-grade combination
+    alpha_mat <- matrix(
+      rlnorm(n_students * n_grades, log(0.2), log(2) / 2),
+      nrow = n_students
+    )
+    a_mat <- matrix(
+      rlnorm(n_students * n_grades, log(1.0), log(2) / 2),
+      nrow = n_students
+    )
+  }
+
+  # ── AR(1) cross-wave covariance structure ───────────────────────────────────
+  # Captures persistent student ability across grades — gives TVAAS
+  # something to learn that CVA/SWVAM cannot exploit
+  Sigma_base <- rho^abs(outer(1:n_grades, 1:n_grades, "-"))
+
+  # ── Generate outcomes ───────────────────────────────────────────────────────
+  rows <- vector("list", n_students * n_grades)
+  k    <- 1L
+
+  for (i in seq_len(n_students)) {
+    j_vec <- teacher_assign[i, ]
+
+    # School effect from first grade teacher (stable within school)
+    s <- teacher_school[j_vec[1]]
+
+    # Mean vector across grades — teacher + school
+    mu_vec <- sapply(seq_len(n_grades), function(g) {
+      alpha_mat[i, g] * theta_true[j_vec[g]] + school_effects[s]
+    })
+
+    # Student-specific precision scales covariance
+    # Use first grade a_i as the baseline precision
+    sigma_i <- 1.0 / sqrt(a_mat[i, 1])
+    Sigma_i <- Sigma_base * sigma_i^2
+
+    # Draw all grades jointly — this is the key change for TVAAS
+    scores_i <- MASS::mvrnorm(1, mu_vec, Sigma_i)
+
+    for (g in seq_len(n_grades)) {
+      rows[[k]] <- list(
+        student_id = i,
+        teacher_id = j_vec[g],
+        school_id  = s,
+        grade      = g,
+        y          = scores_i[g]
+      )
+      k <- k + 1L
+    }
+  }
+
+  data <- bind_rows(rows)
+
+  list(
+    data           = data,
+    theta_true     = theta_true,
+    school_effects = school_effects,
+    teacher_school = teacher_school,
+    student_school = student_school
+  )
+}
+```
+
+
+
+
+
+```{r}
+make_sim_unified_data <- function(df, n_teachers, n_students, n_grades) {
+
+  # Wide score matrix
+  Y_wide <- df |>
+    arrange(student_id, grade) |>
+    pivot_wider(id_cols=student_id, names_from=grade,
+                values_from=y, names_prefix="grade_") |>
+    arrange(student_id) |>
+    dplyr::select(-student_id) |>
+    as.matrix()
+
+  # Wide teacher matrix
+  T_wide <- df |>
+    arrange(student_id, grade) |>
+    pivot_wider(id_cols=student_id, names_from=grade,
+                values_from=teacher_id, names_prefix="grade_") |>
+    arrange(student_id) |>
+    dplyr::select(-student_id) |>
+    as.matrix()
+
+  # Wide peer achievement matrix
+  peer <- df |>
+    group_by(school_id, grade) |>
+    mutate(P = mean(y)) |>
+    ungroup()
+
+  P_wide <- peer |>
+    arrange(student_id, grade) |>
+    pivot_wider(id_cols=student_id, names_from=grade,
+                values_from=P, names_prefix="grade_") |>
+    arrange(student_id) |>
+    dplyr::select(-student_id) |>
+    as.matrix()
+
+  # Student covariates X (dummy for simulation)
+  X_mat <- matrix(0.0, nrow=n_students, ncol=1L)
+
+  # School covariates S (school membership)
+  S_mat <- matrix(as.numeric(
+    df |> distinct(teacher_id) |> arrange(teacher_id) |>
+    left_join(df |> distinct(teacher_id, school_id), by="teacher_id") |>
+    pull(school_id)
+  ), ncol=1)
+
+  # Observation mask — all observed in simulation
+  obs_mask  <- matrix(1L, nrow=n_students, ncol=n_grades)
+  n_obs_vec <- rep(n_grades, n_students)
+
+  # Replace NAs
+  Y_wide[is.na(Y_wide)] <- 0
+  T_wide[is.na(T_wide)] <- 0L
+  P_wide[is.na(P_wide)] <- mean(P_wide, na.rm=TRUE)
+
+  list(
+    N          = n_students,
+    J          = n_teachers,
+    G          = n_grades,
+    K          = ncol(X_mat),
+    L          = ncol(S_mat),
+    Y          = Y_wide,
+    X          = X_mat,
+    P          = P_wide,
+    S          = S_mat,
+    teacher_id = T_wide,
+    obs        = obs_mask,
+    n_obs      = n_obs_vec
+  )
+}
+```
+
+
+```{r}
+evaluate_recovery <- function(theta_estimated, theta_true) {
+  # Correlation with true teacher quality
+  r <- cor(theta_estimated, theta_true, use = "complete.obs")
+
+  # Proportion correctly assigned to quality quartile (Kim Table 2)
+  q_breaks_true <- quantile(theta_true,      probs = 0:4 / 4)
+  q_breaks_est  <- quantile(theta_estimated, probs = 0:4 / 4)
+
+  true_q <- cut(theta_true,      breaks = q_breaks_true,
+                labels = 1:4, include.lowest = TRUE)
+  est_q  <- cut(theta_estimated, breaks = q_breaks_est,
+                labels = 1:4, include.lowest = TRUE)
+
+  pct_correct <- mean(true_q == est_q, na.rm = TRUE)
+
+  list(correlation = round(r, 4), pct_correct_quartile = round(pct_correct, 4))
+}
+```
+
+
+
+
+
+
+
+```{r}
+mod_unified <- cmdstan_model("unified_model.stan")
+
+# Quick test — scenario A, 4 grades
+sim <- simulate_data(n_teachers=10, n_students=100, n_grades=4,
+                     n_schools=2, scenario="A", seed=1)
+
+system.time(
+  fit_unified <- mod_unified$sample(
+    data        = make_sim_unified_data(sim$data, 10, 100, 4),
+    seed        = 1, chains = 1,
+    iter_warmup = 300, iter_sampling = 500,
+    refresh     = 200
+  )
+)
+```
+
+
+
+
+```{r}
+# Convergence
+fit_unified$diagnostic_summary()
+
+# Check key parameters
+fit_unified$summary(c("tau_theta", "theta_raw", "alpha", "a", 
+                       "sigma_wave", "L_corr")) |>
+  filter(rhat > 1.01 | ess_bulk < 400)
+
+# Teacher effects
+fit_unified$summary("theta") |> head(10)
+```
+```{r}
+fit_cva <- mod_cva$sample(
+  data          = make_sim_cva_data(sim$data, 10),
+  seed=1, chains=1, iter_warmup=300, iter_sampling=500, refresh=200)
+
+fit_composite <- mod_composite$sample(
+  data          = make_sim_composite_data(sim$data, 10, 100, sim$teacher_school),
+  seed=1, chains=1, iter_warmup=300, iter_sampling=500, refresh=200)
+
+fit_tvaas <- mod_tvaas$sample(
+  data          = make_sim_tvaas_data(sim$data, 10, 100, 4),
+  seed=1, chains=1, iter_warmup=300, iter_sampling=500, refresh=200)
+
+```
+
+
+
+```{r}
+# Then compare
+theta_unified   <- fit_unified$summary("theta")$mean
+theta_cva       <- fit_cva$summary("theta")$mean
+theta_composite <- fit_composite$summary("theta")$mean
+theta_tvaas     <- fit_tvaas$summary("theta")$mean
+
+cat("CVA:       ", round(cor(theta_cva,       sim$theta_true), 3), "\n")
+cat("Composite: ", round(cor(theta_composite, sim$theta_true), 3), "\n")
+cat("TVAAS:     ", round(cor(theta_tvaas,     sim$theta_true), 3), "\n")
+cat("Unified:   ", round(cor(theta_unified,   sim$theta_true), 3), "\n")
+```
+
+```{r}
+results_unified <- list()
+
+for (s in 1:5) {
+  message(sprintf("Seed %d...", s))
+  
+  sim_s <- simulate_data(n_teachers=10, n_students=100,
+                         n_grades=4, n_schools=2,
+                         scenario="C", seed=s)
+
+  fit_cva_s <- mod_cva$sample(
+    data=make_sim_cva_data(sim_s$data, 10),
+    seed=s, chains=1, iter_warmup=300, iter_sampling=500, refresh=0,
+    show_messages=FALSE)
+
+  fit_comp_s <- mod_composite$sample(
+    data=make_sim_composite_data(sim_s$data, 10, 100, sim_s$teacher_school),
+    seed=s, chains=1, iter_warmup=300, iter_sampling=500, refresh=0,
+    show_messages=FALSE)
+
+  fit_tvaas_s <- mod_tvaas$sample(
+    data=make_sim_tvaas_data(sim_s$data, 10, 100, 4),
+    seed=s, chains=1, iter_warmup=300, iter_sampling=500, refresh=0,
+    show_messages=FALSE)
+
+  fit_unified_s <- mod_unified$sample(
+    data=make_sim_unified_data(sim_s$data, 10, 100, 4),
+    seed=s, chains=1, iter_warmup=300, iter_sampling=500, refresh=0,
+    show_messages=FALSE)
+
+  results_unified[[s]] <- tibble(
+    seed      = s,
+    cva       = cor(fit_cva_s$summary("theta")$mean,     sim_s$theta_true),
+    composite = cor(fit_comp_s$summary("theta")$mean,    sim_s$theta_true),
+    tvaas     = cor(fit_tvaas_s$summary("theta")$mean,   sim_s$theta_true),
+    unified   = cor(fit_unified_s$summary("theta")$mean, sim_s$theta_true)
+  )
+  
+  message(sprintf("  CVA=%.3f  Composite=%.3f  TVAAS=%.3f  Unified=%.3f",
+                  results_unified[[s]]$cva,
+                  results_unified[[s]]$composite,
+                  results_unified[[s]]$tvaas,
+                  results_unified[[s]]$unified))
+}
+
+bind_rows(results_unified) |>
+  summarise(across(cva:unified, ~round(mean(.), 3)))
+```
+
+```{r}
+tibble(
+  model = c("CVA", "Composite", "TVAAS", "Unified"),
+  correlation = c(0.521, 0.638, 0.774, 0.840)
+) |>
+  mutate(model = factor(model, levels = c("CVA", "Composite", "TVAAS", "Unified"))) |>
+  ggplot(aes(x = model, y = correlation, fill = model)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = round(correlation, 3)), vjust = -0.5, size = 3.5) +
+  scale_fill_manual(values = c(
+    "CVA"       = "#378ADD",
+    "Composite" = "#D85A30",
+    "TVAAS"     = "#7F77DD",
+    "Unified"   = "#1D9E75"
+  )) +
+  labs(
+    title    = "Teacher effect recovery across models",
+    subtitle = "Mean correlation with true θ across 5 simulation trials\nScenario A, 4 grades, rho = 0.7",
+    x        = NULL,
+    y        = "Correlation with true θ"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none",
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+```
+
+
+
+

@@ -1,0 +1,1393 @@
+
+---
+title: "Models"
+output: html_document
+date: "2026-03-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(MASS)  
+library(tidyverse)
+library(haven)
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(loo)
+```
+
+
+
+
+
+```{r}
+# Check teacher ID distribution
+table_teachers <- long_clean |> 
+  count(teacher_id) |> 
+  arrange(n)
+
+head(table_teachers, 20)   # how many teachers have only 1 student?
+tail(table_teachers, 20)   # largest classes
+
+cat(sprintf("Teachers with only 1 student: %d (%.1f%%)\n",
+    sum(table_teachers$n == 1),
+    100 * mean(table_teachers$n == 1)))
+```
+
+
+
+
+Section 1: Data cleaning + Loading 
+
+
+```{r}
+SUBJECT <- "math"   # ← change to "reading" if needed
+```
+
+```{r}
+load("~/Stats/Thesis/ECLSK_1998-99_v1_0_R_Datasets/ECLSK_98_99_K8_CHILD_v1_0.rdata")
+```
+
+```{r}
+# Run this once before any subsetting
+raw_full <- ECLSK_98_99_K8_CHILD_v1_0 |>
+  zap_labels() |>
+  mutate(across(where(is.numeric), ~ {
+    x <- .
+    x[x %in% c(-1, -2, -4, -7, -8, -9)] <- NA_real_
+    x
+  }))
+```
+
+
+```{r}
+# ── DEVELOPMENT SUBSET ────────────────────────────────────────────────────────
+# Remove or comment out this block when ready to run on full data
+set.seed(141229)
+raw <- raw_full #|> slice_sample(n = 2000)
+```
+
+
+
+
+```{r}
+# ── 3. Unify teacher ID to subject ────────────────────────────────────────────
+# Waves 6 and 7 have separate reading vs. math teacher IDs.
+# We pick the right one based on SUBJECT.
+raw <- raw |>
+  mutate(
+    teacher_C6 = if (SUBJECT == "math") J62T_ID else J61T_ID,
+    teacher_C7 = if (SUBJECT == "math") J72T_ID else J71T_ID
+  )
+```
+
+```{r}
+# ── 4. Rename score columns to a uniform name ─────────────────────────────────
+score_suffix <- if (SUBJECT == "math") "MSCL" else "RSCL"
+
+raw <- raw |>
+  rename(
+    score_C1 = paste0("C1R4", score_suffix),
+    score_C2 = paste0("C2R4", score_suffix),
+    score_C3 = paste0("C3R4", score_suffix),
+    score_C4 = paste0("C4R4", score_suffix),
+    score_C5 = paste0("C5R4", score_suffix),
+    score_C6 = paste0("C6R4", score_suffix),
+    score_C7 = paste0("C7R4", score_suffix)
+  )
+```
+
+```{r}
+
+# ── Wave info including school characteristic columns ─────────────────────────
+wave_info <- tibble(
+  wave       = c("C1", "C2", "C4", "C5", "C6", "C7"),
+  year       = c(1998L, 1999L, 2000L, 2002L, 2004L, 2007L),
+  score_col  = c("score_C1", "score_C2", "score_C4", "score_C5", "score_C6", "score_C7"),
+  prior_col  = c(NA,         "score_C1", "score_C3", "score_C4", "score_C5", "score_C6"),
+  teach_col  = c("T1_ID",    "T2_ID",    "T4_ID",    "T5_ID",    "teacher_C6", "teacher_C7"),
+  school_col = c("S1_ID",    "S2_ID",    "S4_ID",    "S5_ID",    "S6_ID",      "S7_ID"),
+  # School characteristics — use closest available wave
+  enrls_col  = c(NA,         NA,         "S4ENRLS",  "S5ENRLS",  "S6ENRLS",    "S7ENRLS"),
+  minor_col  = c(NA,         NA,         "S4MINOR",  "S5MINOR",  "S6MINOR",    "S7MINOR"),
+  sctyp_col  = c(NA,         NA,         "S4SCTYP",  "S5SCTYP",  "S6SCTYP",    "S7SCTYP"),
+  urban_col  = c(NA,         "R3URBAN",  "R4URBAN",  "R5URBAN",  "R6URBAN",    "R7URBAN"),
+  region_col = c(NA,         "R3REGION", "R4REGION", "R5REGION", "R6REGION",   "R7REGION")
+)
+
+long_list <- vector("list", nrow(wave_info))
+
+for (i in seq_len(nrow(wave_info))) {
+  w <- wave_info[i, ]
+
+  tmp <- raw |>
+    dplyr::select(
+      CHILDID,
+      GENDER, RACE, P1DISABL, WKSESL, WKPOV_R,
+      score      = all_of(w$score_col),
+      teacher_id = all_of(w$teach_col),
+      school_id  = all_of(w$school_col)
+    ) |>
+    mutate(
+      wave        = w$wave,
+      year        = w$year,
+      prior_score = if (is.na(w$prior_col)) NA_real_ else raw[[w$prior_col]],
+      S_enrls     = if (is.na(w$enrls_col))  NA_real_ else raw[[w$enrls_col]],
+      S_minor     = if (is.na(w$minor_col))  NA_real_ else raw[[w$minor_col]],
+      S_sctyp     = if (is.na(w$sctyp_col))  NA_real_ else raw[[w$sctyp_col]],
+      S_urban     = if (is.na(w$urban_col))  NA_real_ else raw[[w$urban_col]],
+      S_region    = if (is.na(w$region_col)) NA_real_ else raw[[w$region_col]]
+    )
+
+  long_list[[i]] <- tmp
+}
+
+long <- bind_rows(long_list)
+message(sprintf("  Long data: %d rows before filtering", nrow(long)))
+```
+
+```{r}
+
+# ── 6. Filter ──────────────────────────────────────────────────────────────────
+# Keep only rows where we have:
+#   • a valid outcome score
+#   • a valid prior score (drops wave C1 since it has no prior)
+#   • a non-missing teacher ID
+long_clean <- long |>
+  filter(
+    !is.na(score),
+    !is.na(prior_score),
+    !is.na(teacher_id)
+  )
+message(sprintf("  After filtering: %d rows, %d unique children, %d unique teachers",
+                nrow(long_clean),
+                n_distinct(long_clean$CHILDID),
+                n_distinct(long_clean$teacher_id)))
+
+```
+
+```{r}
+long_clean <- long_clean |>
+  mutate(
+    female   = as.integer(GENDER == 2),
+    black    = as.integer(RACE == 2),
+    hispanic = as.integer(RACE == 3),
+    asian    = as.integer(RACE == 4),
+    other_race = as.integer(RACE == 5),   # White (1) is reference
+    disabled = as.integer(P1DISABL == 1),
+    poverty  = as.integer(WKPOV_R == 1)
+  )
+```
+
+
+```{r}
+score_mean  <- mean(long_clean$score,       na.rm = TRUE)
+score_sd    <- sd(long_clean$score,         na.rm = TRUE)
+prior_mean  <- mean(long_clean$prior_score, na.rm = TRUE)
+prior_sd    <- sd(long_clean$prior_score,   na.rm = TRUE)
+ses_mean    <- mean(long_clean$WKSESL,      na.rm = TRUE)
+ses_sd      <- sd(long_clean$WKSESL,        na.rm = TRUE)
+
+long_clean <- long_clean |>
+  mutate(
+    y_std      = (score       - score_mean) / score_sd,
+    y_prev_std = (prior_score - prior_mean) / prior_sd,
+    ses_std    = (WKSESL      - ses_mean)   / ses_sd
+  )
+```
+
+
+
+
+```{r}
+
+# Drop stale teacher_idx before rebuilding
+long_clean <- long_clean |> dplyr::select(-any_of("teacher_idx"))
+
+teacher_index <- long_clean |>
+  distinct(teacher_id) |>
+  arrange(teacher_id) |>
+  mutate(teacher_idx = row_number())
+
+long_clean <- long_clean |>
+  left_join(teacher_index, by = "teacher_id")
+
+X_mat <- long_clean |>
+  dplyr::select(female, black, hispanic, asian, 
+                other_race, disabled, poverty, ses_std) |>
+  as.matrix()
+
+# Replace any remaining NAs in X with column means (simple imputation)
+# For a more principled approach, consider multiple imputation before this step.
+col_means <- colMeans(X_mat, na.rm = TRUE)
+for (k in seq_len(ncol(X_mat))) {
+  X_mat[is.na(X_mat[, k]), k] <- col_means[k]
+}
+
+# ── 11. Assemble stan_data ─────────────────────────────────────────────────────
+stan_data <- list(
+  N          = nrow(long_clean),
+  J          = max(long_clean$teacher_idx),
+  K          = ncol(X_mat),
+  y          = long_clean$y_std,
+  y_prev     = long_clean$y_prev_std,
+  X          = X_mat,
+  teacher_id = long_clean$teacher_idx
+)
+
+message("stan_data ready:")
+message(sprintf("  N = %d observations", stan_data$N))
+message(sprintf("  J = %d teachers",     stan_data$J))
+message(sprintf("  K = %d covariates",   stan_data$K))
+```
+
+
+```{r}
+# ── Drop teachers with fewer than 5 students ──────────────────────────────────
+# Place this BEFORE the stan_data_prep chunk
+valid_teachers <- long_clean |>
+  count(teacher_id) |>
+  filter(n >= 10) |>
+  pull(teacher_id)
+
+long_clean <- long_clean |>
+  filter(teacher_id %in% valid_teachers)
+
+message(sprintf("After threshold=5: %d rows, %d teachers",
+                nrow(long_clean), n_distinct(long_clean$teacher_id)))
+```
+```{r}
+long_clean |>
+  dplyr::select(CHILDID, wave, score) |>
+  pivot_wider(names_from = wave, values_from = score) |>
+  dplyr::select(-CHILDID) |>
+  cor(use = "pairwise.complete.obs") |>
+  round(3)
+```
+
+
+
+```{r stan_data_prep}
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSOLIDATED STAN DATA PREP
+# Produces: stan_data (CVA) and stan_data_swvam (one-step SWVAM)
+# Run this single chunk before fitting either model.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Drop any stale index columns from previous runs before rebuilding
+long_clean <- long_clean |>
+  select(-any_of(c("teacher_idx", "student_idx", "time_idx",
+                   "teacher_idx.x", "teacher_idx.y",
+                   "student_idx.x", "student_idx.y",
+                   "time_idx.x",    "time_idx.y")))
+
+# ── 1. Encode categorical covariates ──────────────────────────────────────────
+long_clean <- long_clean |>
+  mutate(
+    female     = as.integer(GENDER   == 2),
+    black      = as.integer(RACE     == 2),
+    hispanic   = as.integer(RACE     == 3),
+    asian      = as.integer(RACE     == 4),
+    other_race = as.integer(RACE     == 5),
+    disabled   = as.integer(P1DISABL == 1),
+    poverty    = as.integer(WKPOV_R  == 1)
+  )
+
+# ── 2. Standardise continuous variables ───────────────────────────────────────
+score_mean <- mean(long_clean$score,       na.rm = TRUE)
+score_sd   <- sd(long_clean$score,         na.rm = TRUE)
+prior_mean <- mean(long_clean$prior_score, na.rm = TRUE)
+prior_sd   <- sd(long_clean$prior_score,   na.rm = TRUE)
+ses_mean   <- mean(long_clean$WKSESL,      na.rm = TRUE)
+ses_sd     <- sd(long_clean$WKSESL,        na.rm = TRUE)
+
+long_clean <- long_clean |>
+  mutate(
+    y_std      = (score       - score_mean) / score_sd,
+    y_prev_std = (prior_score - prior_mean) / prior_sd,
+    ses_std    = (WKSESL      - ses_mean)   / ses_sd
+  )
+
+# ── 3. Step 1 OLS (for SWVAM residuals, also cleans NAs) ─────────────────────
+step1_vars <- c("y_std", "y_prev_std", "wave", "female", "black", "hispanic",
+                "asian", "other_race", "disabled", "ses_std", "poverty")
+
+complete_rows <- complete.cases(long_clean[, step1_vars])
+message(sprintf("  Complete cases: %d of %d rows (%.1f%% dropped)",
+                sum(complete_rows), nrow(long_clean),
+                100 * mean(!complete_rows)))
+
+step1_formula <- y_std ~ y_prev_std + wave + female + black + hispanic +
+                         asian + other_race + disabled + ses_std + poverty
+step1_fit     <- lm(step1_formula, data = long_clean[complete_rows, ])
+
+long_clean$gamma <- NA_real_
+long_clean$gamma[complete_rows] <- residuals(step1_fit)
+
+# Keep only rows with valid gamma (i.e. complete cases)
+long_clean <- long_clean |> filter(!is.na(gamma))
+message(sprintf("  Rows after step 1 filter: %d", nrow(long_clean)))
+
+# ── 4. Build contiguous indices ───────────────────────────────────────────────
+teacher_index <- long_clean |>
+  distinct(teacher_id) |>
+  arrange(teacher_id) |>
+  mutate(teacher_idx = row_number())
+
+student_index <- long_clean |>
+  distinct(CHILDID) |>
+  arrange(CHILDID) |>
+  mutate(student_idx = row_number())
+
+time_index <- long_clean |>
+  distinct(wave) |>
+  arrange(wave) |>
+  mutate(time_idx = row_number())
+
+long_clean <- long_clean |>
+  left_join(teacher_index, by = "teacher_id") |>
+  left_join(student_index, by = "CHILDID")    |>
+  left_join(time_index,    by = "wave")
+
+# ── 5. Build covariate matrix X ───────────────────────────────────────────────
+X_mat <- long_clean |>
+  select(female, black, hispanic, asian, other_race, disabled, poverty, ses_std) |>
+  as.matrix()
+
+# Mean-impute any remaining NAs in X
+col_means <- colMeans(X_mat, na.rm = TRUE)
+for (k in seq_len(ncol(X_mat))) {
+  X_mat[is.na(X_mat[, k]), k] <- col_means[k]
+}
+
+# ── 6. Verify all required columns exist ──────────────────────────────────────
+required <- c("student_idx", "teacher_idx", "time_idx", "y_std", "y_prev_std",
+              "gamma", "wave")
+missing  <- required[!required %in% names(long_clean)]
+if (length(missing) > 0) stop("Missing columns: ", paste(missing, collapse = ", "))
+message("  All required columns present")
+
+# ── 7. CVA stan_data ──────────────────────────────────────────────────────────
+stan_data <- list(
+  N          = nrow(long_clean),
+  J          = max(long_clean$teacher_idx),
+  K          = ncol(X_mat),
+  y          = long_clean$y_std,
+  y_prev     = long_clean$y_prev_std,
+  X          = X_mat,
+  teacher_id = long_clean$teacher_idx
+)
+
+message(sprintf("  CVA   — N=%d, J=%d teachers, K=%d covariates",
+                stan_data$N, stan_data$J, stan_data$K))
+
+# ── 8. SWVAM stan_data ────────────────────────────────────────────────────────
+stan_data_swvam <- list(
+  N          = nrow(long_clean),
+  I          = max(long_clean$student_idx),
+  J          = max(long_clean$teacher_idx),
+  K          = ncol(X_mat),
+  TT         = max(long_clean$time_idx),
+  y          = long_clean$y_std,
+  y_prev     = long_clean$y_prev_std,   
+  X          = X_mat,
+  student_id = long_clean$student_idx,
+  teacher_id = long_clean$teacher_idx,
+  time_id    = long_clean$time_idx
+)
+
+message(sprintf("  SWVAM — N=%d, I=%d students, J=%d teachers, TT=%d waves",
+                stan_data_swvam$N, stan_data_swvam$I,
+                stan_data_swvam$J, stan_data_swvam$TT))
+```
+
+
+
+```{r}
+# ── Peer achievement P_it ──────────────────────────────────────────────────────
+# Mean prior score of all students in the same school-wave cohort
+peer_means <- long_clean |>
+  group_by(school_id, wave) |>
+  summarise(P = mean(y_prev_std, na.rm = TRUE), .groups = "drop")
+
+long_clean <- long_clean |>
+  left_join(peer_means, by = c("school_id", "wave"))
+
+# ── School covariate matrix S (one row per teacher) ────────────────────────────
+# Using school size, type, urbanicity, % minority as S_j
+# These are time-varying in ECLS-K so we take the value at the teacher's wave
+S_mat <- long_clean |>
+  distinct(teacher_idx, .keep_all = TRUE) |>
+  arrange(teacher_idx) |>
+  select(S_enrls, S_sctyp, S_urban, S_minor) |>  # ← rename to your actual col names
+  as.matrix()
+
+# Mean-impute NAs
+S_means <- colMeans(S_mat, na.rm = TRUE)
+for (k in seq_len(ncol(S_mat))) {
+  S_mat[is.na(S_mat[, k]), k] <- S_means[k]
+}
+
+# ── stan_data_composite ────────────────────────────────────────────────────────
+stan_data_composite <- list(
+  N          = nrow(long_clean),
+  I          = max(long_clean$student_idx),
+  J          = max(long_clean$teacher_idx),
+  K          = ncol(X_mat),
+  L          = ncol(S_mat),
+  TT         = max(long_clean$time_idx),
+  y          = long_clean$y_std,
+  y_prev     = long_clean$y_prev_std,
+  P          = long_clean$P,
+  X          = X_mat,
+  S          = S_mat,
+  student_id = long_clean$student_idx,
+  teacher_id = long_clean$teacher_idx,
+  time_id    = long_clean$time_idx
+)
+
+message(sprintf("  Composite — N=%d, I=%d, J=%d, K=%d, L=%d, TT=%d",
+                stan_data_composite$N, stan_data_composite$I,
+                stan_data_composite$J, stan_data_composite$K,
+                stan_data_composite$L, stan_data_composite$TT))
+```
+```{r}
+# ── Helper functions (define once, use everywhere) ───────────────
+get_theta <- function(fit, index_df, col_name) {
+  fit$summary("theta", mean) |>
+    mutate(teacher_idx = as.integer(str_extract(variable, "\\d+"))) |>
+    left_join(index_df, by = "teacher_idx") |>
+    select(teacher_id, !!col_name := mean)
+}
+
+make_theta_summary <- function(fit, index_df) {
+  fit$summary("theta", mean, sd, ~quantile(.x, c(0.05, 0.95))) |>
+    rename(mean = mean, sd = sd, q05 = `5%`, q95 = `95%`) |>
+    mutate(
+      teacher_idx = as.integer(str_extract(variable, "\\d+")),
+      teacher_id  = index_df$teacher_id[teacher_idx]
+    ) |>
+    arrange(mean)
+}
+```
+
+
+```{r}
+mod <- cmdstan_model("cva_model.stan")
+fit <- mod$sample(
+  data            = stan_data,
+  seed            = 141229,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 1500,
+  iter_sampling   = 2000,
+  adapt_delta     = 0.95,
+  max_treedepth   = 12,
+  refresh         = 200,
+  output_dir      = file.path(getwd(), "stan_fits")
+)
+fit$save_object(file.path(getwd(), "stan_fits/fit_cva.rds"))
+```
+
+
+
+```{r}
+mod_swvam <- cmdstan_model("swvam_model.stan")
+
+# CVA and SWVAM
+fit_swvam <- mod_swvam$sample(
+  data            = stan_data_swvam,
+  seed            = 141229,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 1500,   # ↑ from 1000 — more teachers = harder geometry
+  iter_sampling   = 2000,
+  adapt_delta     = 0.95,   # ← add this, reduces divergences
+  max_treedepth   = 12,     # ← add this, default 10 can hit ceiling
+  refresh         = 200,
+  output_dir      = "stan_fits"  # ← critical for full data, saves to disk
+)
+```
+
+
+
+
+
+```{r}
+# Composite Model 
+# ── Fit ────────────────────────────────────────────────────────────────────────
+mod_composite <- cmdstan_model("composite_model.stan")
+
+fit_composite <- mod_composite$sample(
+  data            = stan_data_composite,
+  seed            = 141229,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 1500,   # ↑ from 1000 — more teachers = harder geometry
+  iter_sampling   = 2000,
+  adapt_delta     = 0.95,   # ← add this, reduces divergences
+  max_treedepth   = 12,     # ← add this, default 10 can hit ceiling
+  refresh         = 200,
+  output_dir      = "stan_fits"
+)
+
+```
+
+
+
+```{r}
+fit_composite$diagnostic_summary()
+```
+
+
+
+```{r}
+# ── LOO comparison across all three models ────────────────────────────────────
+loo_cva       <- fit$loo()
+loo_swvam     <- fit_swvam$loo()
+loo_composite <- fit_composite$loo()
+
+loo_compare(loo_cva, loo_swvam, loo_composite)
+```
+
+```{r}
+plot(loo_cva)  # flags high-k observations
+```
+
+```{r}
+print(loo_compare(loo_cva, loo_swvam, loo_composite), simplify = FALSE)
+```
+
+```{r}
+# Check each model's elpd_loo directly
+cat("CVA elpd_loo:      ", loo_cva$estimates["elpd_loo", "Estimate"], "\n")
+cat("SWVAM elpd_loo:    ", loo_swvam$estimates["elpd_loo", "Estimate"], "\n")
+cat("Composite elpd_loo:", loo_composite$estimates["elpd_loo", "Estimate"], "\n")
+
+cat("CVA p_loo:      ", loo_cva$estimates["p_loo", "Estimate"], "\n")
+cat("SWVAM p_loo:    ", loo_swvam$estimates["p_loo", "Estimate"], "\n")
+cat("Composite p_loo:", loo_composite$estimates["p_loo", "Estimate"], "\n")
+```
+```{r}
+# Verify N matches
+length(loo_cva$pointwise[, "elpd_loo"])   # should match stan_data$N
+stan_data$N
+```
+```{r}
+fit$diagnostic_summary()
+
+fit$summary(c("mu0", "beta", "tau", "sigma")) |>
+  select(variable, mean, sd, rhat, ess_bulk, ess_tail)
+```
+```{r}
+sum(loo_cva$diagnostics$pareto_k > 0.7)   # bad observations
+sum(loo_cva$diagnostics$pareto_k > 0.5)   # borderline
+
+# See what proportion are problematic
+table(cut(loo_cva$diagnostics$pareto_k,
+          breaks = c(-Inf, 0.5, 0.7, 1, Inf),
+          labels = c("good (<0.5)", "ok (0.5-0.7)", "bad (0.7-1)", "very bad (>1)")))
+```
+```{r}
+# Fast version — just check a random sample of student parameters
+set.seed(42)
+a_vars     <- paste0("a[", sample(1:stan_data_swvam$I, 20), "]")
+alpha_vars <- paste0("alpha[", sample(1:stan_data_swvam$I, 20), "]")
+
+fit_swvam$summary(a_vars) |>
+  select(variable, mean, sd, rhat, ess_bulk)
+
+fit_swvam$summary(alpha_vars) |>
+  select(variable, mean, sd, rhat, ess_bulk)
+```
+
+
+
+```{r}
+fit$save_object("stan_fits/fit_cva.rds")
+fit_swvam$save_object("stan_fits/fit_swvam.rds")
+fit_composite$save_object("stan_fits/fit_composite.rds")
+```
+
+
+```{r}
+G <- 7
+teacher_cols <- c("T1_ID", "T2_ID", NA, "T4_ID", "T5_ID",
+                  ifelse(SUBJECT == "math", "J62T_ID", "J61T_ID"),
+                  ifelse(SUBJECT == "math", "J72T_ID", "J71T_ID"))
+score_cols <- paste0("score_C", c(1,2,3,4,5,6,7))
+
+# Build wide data
+wide <- raw |> select(CHILDID, all_of(score_cols))
+all_scores <- unlist(wide[, score_cols])
+sc_mean <- mean(all_scores, na.rm = TRUE)
+sc_sd   <- sd(all_scores,   na.rm = TRUE)
+wide <- wide |> mutate(across(all_of(score_cols), ~ (. - sc_mean) / sc_sd))
+
+Y_mat     <- wide |> select(all_of(score_cols)) |> as.matrix()
+obs_mask  <- (!is.na(Y_mat)) * 1L
+Y_mat[is.na(Y_mat)] <- 0
+n_obs_vec <- rowSums(obs_mask)
+keep      <- n_obs_vec > 0
+Y_mat     <- Y_mat[keep, ]
+obs_mask  <- obs_mask[keep, ]
+n_obs_vec <- n_obs_vec[keep]
+N_tvaas   <- nrow(Y_mat)
+
+# Build initial teacher index
+all_teacher_ids <- c()
+for (g in seq_len(G)) {
+  tc <- teacher_cols[g]
+  if (!is.na(tc) && tc %in% names(raw))
+    all_teacher_ids <- c(all_teacher_ids, raw[[tc]][keep])
+}
+all_teacher_ids <- na.omit(unique(all_teacher_ids))
+
+tvaas_teacher_index <- tibble(teacher_id = all_teacher_ids) |>
+  arrange(teacher_id) |>
+  mutate(teacher_idx = row_number())
+
+# Build teacher array
+teacher_array <- matrix(0L, nrow = N_tvaas, ncol = G)
+for (g in seq_len(G)) {
+  tc <- teacher_cols[g]
+  if (!is.na(tc) && tc %in% names(raw)) {
+    ids  <- raw[[tc]][keep]
+    idxs <- tvaas_teacher_index$teacher_idx[match(ids, tvaas_teacher_index$teacher_id)]
+    idxs[is.na(idxs)] <- 0L
+    teacher_array[, g] <- idxs
+  }
+}
+
+# ── Filter to >= 5 students and reindex contiguously ─────────────────────────
+valid_tvaas_teachers <- tibble(teacher_idx = as.vector(teacher_array[teacher_array > 0])) |>
+  count(teacher_idx) |>
+  filter(n >= 5) |>
+  left_join(tvaas_teacher_index, by = "teacher_idx") |>  # map idx → id
+  pull(teacher_id)
+
+# Rebuild index with fresh contiguous numbering
+tvaas_teacher_index <- tvaas_teacher_index |>
+  filter(teacher_id %in% valid_tvaas_teachers) |>
+  mutate(teacher_idx_new = row_number())
+
+# Remap array to new contiguous indices
+teacher_array_clean <- matrix(0L, nrow = N_tvaas, ncol = G)
+for (g in seq_len(G)) {
+  old_idx <- teacher_array[, g]
+  new_idx <- tvaas_teacher_index$teacher_idx_new[
+    match(old_idx, tvaas_teacher_index$teacher_idx)
+  ]
+  new_idx[is.na(new_idx)] <- 0L
+  teacher_array_clean[, g] <- new_idx
+}
+
+# Finalise index
+tvaas_teacher_index <- tvaas_teacher_index |>
+  select(teacher_id, teacher_idx = teacher_idx_new)
+
+stan_data_tvaas <- list(
+  N          = N_tvaas,
+  J          = as.integer(max(tvaas_teacher_index$teacher_idx)),
+  G          = G,
+  Y          = Y_mat,
+  obs        = obs_mask,
+  n_obs      = n_obs_vec,
+  teacher_id = teacher_array_clean
+)
+
+message(sprintf("  TVAAS — N=%d students, J=%d teachers, G=%d waves",
+                stan_data_tvaas$N, stan_data_tvaas$J, stan_data_tvaas$G))
+```
+
+
+
+
+
+
+```{r}
+# ── Fit ────────────────────────────────────────────────────────────────────────
+mod_tvaas <- cmdstan_model("tvaas_model.stan")
+
+fit_tvaas <- mod_tvaas$sample(
+  data            = stan_data_tvaas,
+  seed            = 141229,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 1500,   # ↑ from 1000 — more teachers = harder geometry
+  iter_sampling   = 2000,
+  adapt_delta     = 0.95,   # ← add this, reduces divergences
+  max_treedepth   = 12,     # ← add this, default 10 can hit ceiling
+  refresh         = 200,
+  output_dir      = "stan_fits"
+)
+```
+
+
+
+
+```{r}
+# Extract teacher effects from each fit
+theta_cva       <- fit$summary("theta")$mean
+theta_swvam     <- fit_swvam$summary("theta")$mean
+theta_composite <- fit_composite$summary("theta")$mean
+
+# Note: You'll need to match them by teacher_id since 
+# the indices might differ between the wide and long formats.
+```
+
+
+```{r}
+theta_summary_cva <- fit$summary("theta", mean, sd, ~quantile(.x, c(0.05, 0.95))) |>
+  rename(mean = mean, sd = sd, q05 = `5%`, q95 = `95%`) |>
+  mutate(
+    teacher_idx = as.integer(str_extract(variable, "\\d+")),
+    teacher_id  = teacher_index$teacher_id[teacher_idx]
+  ) |>
+  arrange(mean)
+
+theta_summary_composite <- fit_composite$summary("theta", mean, sd, ~quantile(.x, c(0.05, 0.95))) |>
+  rename(mean = mean, sd = sd, q05 = `5%`, q95 = `95%`) |>
+  mutate(
+    teacher_idx = as.integer(str_extract(variable, "\\d+")),
+    teacher_id  = teacher_index$teacher_id[teacher_idx]
+  ) |>
+  arrange(mean)
+```
+
+
+```{r}
+
+merged_df <- theta_summary_cva |>
+  select(teacher_id, cva_mean = mean) |>
+  left_join(theta_summary_composite |> select(teacher_id, comp_mean = mean), by = "teacher_id")
+
+ggplot(merged_df, aes(x = cva_mean, y = comp_mean)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(intercept = 0, slope = 1, color = "red") + # The 'identity' line
+  labs(title = "CVA vs. Composite Model Teacher Effects",
+       x = "CVA Estimate (theta)",
+       y = "Composite Estimate (theta)")
+       
+```
+
+
+```{r}
+library(bayesplot)
+
+# Extract only the posterior means for theta
+mcmc_areas(as_draws(fit_composite), pars = c("theta[1]", "theta[2]", "theta[3]", "theta[4]"))
+```
+
+```{r}
+theta_summary_swvam <- fit_swvam$summary("theta", mean, sd, ~quantile(.x, c(0.05, 0.95))) |>
+  rename(mean = mean, sd = sd, q05 = `5%`, q95 = `95%`) |>
+  mutate(
+    teacher_idx = as.integer(str_extract(variable, "\\d+")),
+    teacher_id  = teacher_index$teacher_id[teacher_idx]
+  ) |>
+  arrange(mean)
+```
+
+```{r}
+# Build all four teacher effect summaries at once
+make_theta_summary <- function(fit, index_df) {
+  fit$summary("theta", mean, sd, ~quantile(.x, c(0.05, 0.95))) |>
+    rename(mean = mean, sd = sd, q05 = `5%`, q95 = `95%`) |>
+    mutate(
+      teacher_idx = as.integer(str_extract(variable, "\\d+")),
+      teacher_id  = index_df$teacher_id[teacher_idx]
+    ) |>
+    arrange(mean)
+}
+
+theta_summary_cva       <- make_theta_summary(fit,           teacher_index)
+theta_summary_swvam     <- make_theta_summary(fit_swvam,     teacher_index)
+theta_summary_composite <- make_theta_summary(fit_composite, teacher_index)
+theta_tvaas             <- fit_tvaas$summary("theta", mean, sd) |>
+  mutate(teacher_idx = as.integer(str_extract(variable, "\\d+"))) |>
+  left_join(tvaas_teacher_index, by = "teacher_idx") |>
+  rename(tvaas_mean = mean, tvaas_sd = sd)
+```
+
+
+
+
+
+
+```{r}
+all_theta <- theta_summary_cva |>
+  select(teacher_id, cva = mean) |>
+  left_join(theta_summary_swvam     |> select(teacher_id, swvam     = mean), by = "teacher_id") |>
+  left_join(theta_summary_composite |> select(teacher_id, composite = mean), by = "teacher_id") |>
+  left_join(theta_tvaas             |> select(teacher_id, tvaas     = tvaas_mean), by = "teacher_id") |>
+  filter(complete.cases(pick(everything())))
+
+message(sprintf("Teachers matched across all four models: %d", nrow(all_theta)))
+
+cor(all_theta[, c("cva", "swvam", "composite", "tvaas")], use = "complete.obs") |>
+  round(3)
+```
+
+
+
+
+
+
+```{r}
+clean_for_split <- function(df) {
+  df |> select(-any_of(c("teacher_idx", "student_idx", "time_idx",
+                          "teacher_idx.x", "teacher_idx.y",
+                          "student_idx.x", "student_idx.y",
+                          "time_idx.x", "time_idx.y")))
+}
+
+long_A <- long_clean |> filter(CHILDID %in% cohort_A) |> clean_for_split()
+long_B <- long_clean |> filter(CHILDID %in% cohort_B) |> clean_for_split()
+
+long_A <- reindex_teachers(long_A) |> reindex_all()
+long_B <- reindex_teachers(long_B) |> reindex_all()
+
+# Verify peer join works
+test_peer <- long_A |> group_by(school_id, wave) |>
+  summarise(P = mean(y_prev_std, na.rm = TRUE), .groups = "drop")
+nrow(test_peer)   # should be > 0
+head(test_peer)
+```
+```{r}
+make_composite_data <- function(df) {
+  X <- make_X(df)
+
+  # Drop P if it already exists to avoid .x/.y conflict
+  df <- df |> select(-any_of("P"))
+
+  peer <- df |> group_by(school_id, wave) |>
+    summarise(P = mean(y_prev_std, na.rm = TRUE), .groups = "drop")
+  df <- df |> left_join(peer, by = c("school_id", "wave"))
+
+  p_vals <- df[["P"]]
+  p_vals[is.na(p_vals)] <- mean(p_vals, na.rm = TRUE)
+  df[["P"]] <- p_vals
+
+  S <- df |> distinct(teacher_idx, .keep_all = TRUE) |>
+    arrange(teacher_idx) |>
+    select(S_enrls, S_minor, S_sctyp, S_urban) |> as.matrix()
+  S_means <- colMeans(S, na.rm = TRUE)
+  for (k in seq_len(ncol(S))) S[is.na(S[,k]), k] <- S_means[k]
+
+  list(N=nrow(df), I=max(df$student_idx), J=max(df$teacher_idx),
+       K=ncol(X), L=ncol(S), TT=max(df$time_idx),
+       y=df$y_std, y_prev=df$y_prev_std, P=df[["P"]], X=X, S=S,
+       student_id=df$student_idx, teacher_id=df$teacher_idx,
+       time_id=df$time_idx)
+}
+```
+
+
+```{r}
+# ── Full stability analysis — run this entire chunk at once ───────────────────
+
+# Step 1: Split
+set.seed(42)
+child_ids <- unique(long_clean$CHILDID)
+cohort_A  <- sample(child_ids, floor(length(child_ids) / 2))
+cohort_B  <- setdiff(child_ids, cohort_A)
+
+# Step 2: Helper functions
+clean_for_split <- function(df) {
+  df |> select(-any_of(c("teacher_idx", "student_idx", "time_idx",
+                          "P", "teacher_idx.x", "teacher_idx.y",
+                          "student_idx.x", "student_idx.y",
+                          "time_idx.x", "time_idx.y")))
+}
+
+reindex_teachers <- function(df) {
+  idx <- df |> distinct(teacher_id) |> arrange(teacher_id) |>
+    mutate(teacher_idx = row_number())
+  df |> left_join(idx, by = "teacher_id")
+}
+
+reindex_all <- function(df) {
+  s_idx <- df |> distinct(CHILDID) |> arrange(CHILDID) |>
+    mutate(student_idx = row_number())
+  t_idx <- df |> distinct(wave) |> arrange(wave) |>
+    mutate(time_idx = row_number())
+  df |> left_join(s_idx, by = "CHILDID") |> left_join(t_idx, by = "wave")
+}
+
+make_X <- function(df) {
+  X <- df |> select(female, black, hispanic, asian,
+                    other_race, disabled, poverty, ses_std) |> as.matrix()
+  col_means <- colMeans(X, na.rm = TRUE)
+  for (k in seq_len(ncol(X))) X[is.na(X[,k]), k] <- col_means[k]
+  X
+}
+
+make_composite_data <- function(df) {
+  X <- make_X(df)
+
+  # Compute P fresh (P already dropped in clean_for_split)
+  peer <- df |> group_by(school_id, wave) |>
+    summarise(P = mean(y_prev_std, na.rm = TRUE), .groups = "drop")
+  df <- df |> left_join(peer, by = c("school_id", "wave"))
+  p_vals <- df[["P"]]
+  p_vals[is.na(p_vals)] <- mean(p_vals, na.rm = TRUE)
+  df[["P"]] <- p_vals
+
+  S <- df |> distinct(teacher_idx, .keep_all = TRUE) |>
+    arrange(teacher_idx) |>
+    select(S_enrls, S_minor, S_sctyp, S_urban) |> as.matrix()
+  S_means <- colMeans(S, na.rm = TRUE)
+  for (k in seq_len(ncol(S))) S[is.na(S[,k]), k] <- S_means[k]
+
+  list(N=nrow(df), I=max(df$student_idx), J=max(df$teacher_idx),
+       K=ncol(X), L=ncol(S), TT=max(df$time_idx),
+       y=df$y_std, y_prev=df$y_prev_std, P=df[["P"]], X=X, S=S,
+       student_id=df$student_idx, teacher_id=df$teacher_idx,
+       time_id=df$time_idx)
+}
+
+make_tvaas_data <- function(keep_ids) {
+  keep  <- raw$CHILDID %in% keep_ids
+  wide  <- raw[keep, ] |> select(CHILDID, all_of(score_cols))
+  wide  <- wide |> mutate(across(all_of(score_cols), ~ (. - sc_mean) / sc_sd))
+  Y     <- wide |> select(all_of(score_cols)) |> as.matrix()
+  obs   <- (!is.na(Y)) * 1L
+  Y[is.na(Y)] <- 0
+  n_obs <- rowSums(obs)
+  keep2 <- n_obs > 0
+  Y <- Y[keep2,]; obs <- obs[keep2,]; n_obs <- n_obs[keep2]
+  t_ids <- c()
+  for (g in seq_len(G)) {
+    tc <- teacher_cols[g]
+    if (!is.na(tc) && tc %in% names(raw))
+      t_ids <- c(t_ids, raw[[tc]][keep][keep2])
+  }
+  t_ids <- na.omit(unique(t_ids))
+  t_idx <- tibble(teacher_id=t_ids) |> arrange(teacher_id) |>
+    mutate(teacher_idx=row_number())
+  tarr  <- matrix(0L, nrow=sum(keep2), ncol=G)
+  for (g in seq_len(G)) {
+    tc <- teacher_cols[g]
+    if (!is.na(tc) && tc %in% names(raw)) {
+      ids  <- raw[[tc]][keep][keep2]
+      idxs <- t_idx$teacher_idx[match(ids, t_idx$teacher_id)]
+      idxs[is.na(idxs)] <- 0L
+      tarr[,g] <- idxs
+    }
+  }
+  list(data=list(N=sum(keep2), J=max(t_idx$teacher_idx), G=G,
+                 Y=Y, obs=obs, n_obs=n_obs, teacher_id=tarr),
+       index=t_idx)
+}
+
+# Step 3: Build cohort data
+long_A <- long_clean |> filter(CHILDID %in% cohort_A) |>
+  clean_for_split() |> reindex_teachers() |> reindex_all()
+long_B <- long_clean |> filter(CHILDID %in% cohort_B) |>
+  clean_for_split() |> reindex_teachers() |> reindex_all()
+
+tvaas_A <- make_tvaas_data(cohort_A)
+tvaas_B <- make_tvaas_data(cohort_B)
+
+# Step 4: Fit all four models
+fit_composite_A <- mod_composite$sample(
+  data=make_composite_data(long_A), seed=42, chains=4, parallel_chains=4,
+  iter_warmup=1000, iter_sampling=2000, refresh=200, output_dir="stan_fits")
+
+fit_composite_B <- mod_composite$sample(
+  data=make_composite_data(long_B), seed=42, chains=4, parallel_chains=4,
+  iter_warmup=1000, iter_sampling=2000, refresh=200, output_dir="stan_fits")
+
+fit_tvaas_A <- mod_tvaas$sample(
+  data=tvaas_A$data, seed=42, chains=4, parallel_chains=4,
+  iter_warmup=1500, iter_sampling=2000, adapt_delta=0.95,
+  refresh=200, output_dir="stan_fits")
+
+fit_tvaas_B <- mod_tvaas$sample(
+  data=tvaas_B$data, seed=42, chains=4, parallel_chains=4,
+  iter_warmup=1500, iter_sampling=2000, adapt_delta=0.95,
+  refresh=200, output_dir="stan_fits")
+
+# Step 5: Stability correlations
+get_theta <- function(fit, index_df, col_name) {
+  fit$summary("theta", mean) |>
+    mutate(teacher_idx = as.integer(str_extract(variable, "\\d+"))) |>
+    left_join(index_df, by = "teacher_idx") |>
+    select(teacher_id, !!col_name := mean)
+}
+
+comp_stability <- get_theta(fit_composite_A,
+    long_A |> distinct(teacher_id, teacher_idx), "cohort_A") |>
+  left_join(get_theta(fit_composite_B,
+    long_B |> distinct(teacher_id, teacher_idx), "cohort_B"), by="teacher_id") |>
+  filter(complete.cases(pick(everything())))
+
+tvaas_stability <- get_theta(fit_tvaas_A, tvaas_A$index, "cohort_A") |>
+  left_join(get_theta(fit_tvaas_B, tvaas_B$index, "cohort_B"), by="teacher_id") |>
+  filter(complete.cases(pick(everything())))
+
+cat("Composite stability:", round(cor(comp_stability$cohort_A, comp_stability$cohort_B), 3), "\n")
+cat("TVAAS stability:    ", round(cor(tvaas_stability$cohort_A, tvaas_stability$cohort_B), 3), "\n")
+```
+
+
+
+```{r}
+cat(sprintf("Teachers in composite stability analysis: %d\n", nrow(comp_stability)))
+cat(sprintf("Teachers in TVAAS stability analysis: %d\n",     nrow(tvaas_stability)))
+cat(sprintf("Avg students per teacher (cohort A): %.1f\n",
+            nrow(long_A) / n_distinct(long_A$teacher_id)))
+```
+
+
+
+
+
+
+
+```{r}
+
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Sample 50 teachers for readability
+set.seed(42)
+sample_teachers <- all_theta |> slice_sample(n = 50) |> pull(teacher_id)
+
+# Build plot data
+plot_data <- bind_rows(
+  theta_summary_cva |> filter(teacher_id %in% sample_teachers) |>
+    mutate(model = "CVA"),
+  theta_summary_swvam |> filter(teacher_id %in% sample_teachers) |>
+    mutate(model = "SWVAM"),
+  theta_summary_composite |> filter(teacher_id %in% sample_teachers) |>
+    mutate(model = "Composite"),
+  theta_tvaas |> filter(teacher_id %in% sample_teachers) |>
+    mutate(model = "TVAAS", mean = tvaas_mean, sd = tvaas_sd,
+           q05 = tvaas_mean - 1.645 * tvaas_sd,
+           q95 = tvaas_mean + 1.645 * tvaas_sd)
+) |>
+  group_by(model) |>
+  mutate(rank = rank(mean)) |>
+  ungroup() |>
+  mutate(model = factor(model, levels = c("CVA", "SWVAM", "Composite", "TVAAS")))
+
+# Plot
+ggplot(plot_data, aes(x = rank, y = mean, ymin = q05, ymax = q95, color = model)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60", linewidth = 0.4) +
+  geom_linerange(alpha = 0.4, linewidth = 0.5) +
+  geom_point(size = 1.2) +
+  facet_wrap(~ model, nrow = 2) +
+  scale_color_manual(values = c(
+    "CVA"       = "#378ADD",
+    "SWVAM"     = "#1D9E75",
+    "Composite" = "#D85A30",
+    "TVAAS"     = "#7F77DD"
+  )) +
+  labs(
+    title    = "Teacher effect estimates across models",
+    subtitle = "Posterior means with 90% credible intervals, 50 sampled teachers ranked within model",
+    x        = "Teacher rank",
+    y        = "θ (standardised units)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "none",
+    strip.text      = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+
+```
+
+```{r}
+# How many students per teacher in the SWVAM data?
+long_clean |>
+  count(teacher_id) |>
+  summarise(
+    mean_students = mean(n),
+    median_students = median(n),
+    pct_one_student = mean(n == 1)
+  )
+```
+
+
+
+
+```{r}
+# ── ECLS-K Stability Analysis ─────────────────────────────────────────────────
+
+# Step 1: Split students into two cohorts
+set.seed(141229)
+child_ids <- unique(long_clean$CHILDID)
+cohort_A  <- sample(child_ids, floor(length(child_ids) / 2))
+cohort_B  <- setdiff(child_ids, cohort_A)
+
+# Step 2: Helper functions
+clean_for_split <- function(df) {
+  df |> dplyr::select(-any_of(c(
+    "teacher_idx", "student_idx", "time_idx", "P",
+    "teacher_idx.x", "teacher_idx.y",
+    "student_idx.x", "student_idx.y",
+    "time_idx.x",    "time_idx.y"
+  )))
+}
+
+reindex_teachers <- function(df) {
+  idx <- df |> distinct(teacher_id) |> arrange(teacher_id) |>
+    mutate(teacher_idx = row_number())
+  df |> left_join(idx, by = "teacher_id")
+}
+
+reindex_all <- function(df) {
+  s_idx <- df |> distinct(CHILDID) |> arrange(CHILDID) |>
+    mutate(student_idx = row_number())
+  t_idx <- df |> distinct(wave) |> arrange(wave) |>
+    mutate(time_idx = row_number())
+  df |> left_join(s_idx, by = "CHILDID") |> left_join(t_idx, by = "wave")
+}
+
+make_X <- function(df) {
+  X <- df |> dplyr::select(female, black, hispanic, asian,
+                            other_race, disabled, poverty, ses_std) |>
+    as.matrix()
+  col_means <- colMeans(X, na.rm = TRUE)
+  for (k in seq_len(ncol(X))) X[is.na(X[, k]), k] <- col_means[k]
+  X
+}
+
+# Apply n >= 10 threshold within each cohort
+apply_threshold <- function(df, min_students = 5) {
+  valid <- df |> count(teacher_id) |>
+    filter(n >= min_students) |>
+    pull(teacher_id)
+  df |> filter(teacher_id %in% valid)
+}
+
+# Step 3: Build cohort datasets with threshold applied
+long_A <- long_clean |>
+  filter(CHILDID %in% cohort_A) |>
+  clean_for_split() |>
+  apply_threshold(5) |>
+  reindex_teachers() |>
+  reindex_all()
+
+long_B <- long_clean |>
+  filter(CHILDID %in% cohort_B) |>
+  clean_for_split() |>
+  apply_threshold(5) |>
+  reindex_teachers() |>
+  reindex_all()
+
+message(sprintf("Cohort A: %d rows, %d teachers, %d students",
+                nrow(long_A), n_distinct(long_A$teacher_id),
+                n_distinct(long_A$CHILDID)))
+message(sprintf("Cohort B: %d rows, %d teachers, %d students",
+                nrow(long_B), n_distinct(long_B$teacher_id),
+                n_distinct(long_B$CHILDID)))
+
+# Step 4: Stan data builders
+
+make_cva_data <- function(df) {
+  X <- make_X(df)
+  list(N=nrow(df), J=max(df$teacher_idx), K=ncol(X),
+       y=df$y_std, y_prev=df$y_prev_std, X=X,
+       teacher_id=df$teacher_idx)
+}
+
+make_swvam_data <- function(df) {
+  X <- make_X(df)
+  list(N=nrow(df), I=max(df$student_idx), J=max(df$teacher_idx),
+       K=ncol(X), TT=max(df$time_idx),
+       y=df$y_std, y_prev=df$y_prev_std, X=X,
+       student_id=df$student_idx, teacher_id=df$teacher_idx,
+       time_id=df$time_idx)
+}
+
+make_composite_data <- function(df) {
+  X <- make_X(df)
+  peer <- df |> group_by(school_id, wave) |>
+    summarise(P = mean(y_prev_std, na.rm = TRUE), .groups = "drop")
+  df <- df |> left_join(peer, by = c("school_id", "wave"))
+  p_vals <- df$P
+  p_vals[is.na(p_vals)] <- mean(p_vals, na.rm = TRUE)
+  df$P <- p_vals
+  S <- df |> distinct(teacher_idx, .keep_all = TRUE) |>
+    arrange(teacher_idx) |>
+    dplyr::select(S_enrls, S_minor, S_sctyp, S_urban) |> as.matrix()
+  S_means <- colMeans(S, na.rm = TRUE)
+  for (k in seq_len(ncol(S))) S[is.na(S[, k]), k] <- S_means[k]
+  list(N=nrow(df), I=max(df$student_idx), J=max(df$teacher_idx),
+       K=ncol(X), L=ncol(S), TT=max(df$time_idx),
+       y=df$y_std, y_prev=df$y_prev_std, P=df$P, X=X, S=S,
+       student_id=df$student_idx, teacher_id=df$teacher_idx,
+       time_id=df$time_idx)
+}
+
+make_tvaas_data <- function(df) {
+  G <- max(df$time_idx)
+  Y_wide <- df |> arrange(CHILDID, wave) |>
+    pivot_wider(id_cols=CHILDID, names_from=wave,
+                values_from=y_std, names_prefix="wave_") |>
+    arrange(CHILDID) |> dplyr::select(-CHILDID) |> as.matrix()
+  T_wide <- df |> arrange(CHILDID, wave) |>
+    pivot_wider(id_cols=CHILDID, names_from=wave,
+                values_from=teacher_idx, names_prefix="wave_") |>
+    arrange(CHILDID) |> dplyr::select(-CHILDID) |> as.matrix()
+  obs <- (!is.na(T_wide)) * 1L
+  Y_wide[is.na(Y_wide)] <- 0
+  T_wide[is.na(T_wide)] <- 0L
+  n_obs <- rowSums(obs)
+  keep  <- n_obs > 0
+  list(N=sum(keep), J=max(df$teacher_idx), G=G,
+       Y=Y_wide[keep,], obs=obs[keep,], n_obs=n_obs[keep],
+       teacher_id=T_wide[keep,])
+}
+
+# Step 5: Fit all four models on both cohorts
+message("Fitting CVA A..."); fit_cva_A <- mod_cva$sample(
+  data=make_cva_data(long_A), seed=42, chains=4, parallel_chains=4,
+  iter_warmup=1500, iter_sampling=2000, refresh=200, output_dir="stan_fits")
+
+message("Fitting CVA B..."); fit_cva_B <- mod_cva$sample(
+  data=make_cva_data(long_B), seed=42, chains=4, parallel_chains=4,
+  iter_warmup=1500, iter_sampling=2000, refresh=200, output_dir="stan_fits")
+
+message("Fitting SWVAM A..."); fit_swvam_A <- mod_swvam$sample(
+  data=make_swvam_data(long_A), seed=42, chains=4, parallel_chains=4,
+  iter_warmup=1500, iter_sampling=2000, refresh=200, output_dir="stan_fits")
+
+message("Fitting SWVAM B..."); fit_swvam_B <- mod_swvam$sample(
+  data=make_swvam_data(long_B), seed=42, chains=4, parallel_chains=4,
+  iter_warmup=1500, iter_sampling=2000, refresh=200, output_dir="stan_fits")
+
+message("Fitting Composite A..."); fit_composite_A <- mod_composite$sample(
+  data=make_composite_data(long_A), seed=42, chains=4, parallel_chains=4,
+  iter_warmup=1500, iter_sampling=2000, adapt_delta=0.95,
+  refresh=200, output_dir="stan_fits")
+
+message("Fitting Composite B..."); fit_composite_B <- mod_composite$sample(
+  data=make_composite_data(long_B), seed=42, chains=4, parallel_chains=4,
+  iter_warmup=1500, iter_sampling=2000, adapt_delta=0.95,
+  refresh=200, output_dir="stan_fits")
+
+message("Fitting TVAAS A..."); fit_tvaas_A <- mod_tvaas$sample(
+  data=make_tvaas_data(long_A), seed=42, chains=4, parallel_chains=4,
+  iter_warmup=1500, iter_sampling=2000, adapt_delta=0.95,
+  max_treedepth=12, refresh=200, output_dir="stan_fits")
+
+message("Fitting TVAAS B..."); fit_tvaas_B <- mod_tvaas$sample(
+  data=make_tvaas_data(long_B), seed=42, chains=4, parallel_chains=4,
+  iter_warmup=1500, iter_sampling=2000, adapt_delta=0.95,
+  max_treedepth=12, refresh=200, output_dir="stan_fits")
+
+# Step 6: Save all fits
+fit_cva_A$save_object("stan_fits/fit_cva_A.rds")
+fit_cva_B$save_object("stan_fits/fit_cva_B.rds")
+fit_swvam_A$save_object("stan_fits/fit_swvam_A.rds")
+fit_swvam_B$save_object("stan_fits/fit_swvam_B.rds")
+fit_composite_A$save_object("stan_fits/fit_composite_A.rds")
+fit_composite_B$save_object("stan_fits/fit_composite_B.rds")
+fit_tvaas_A$save_object("stan_fits/fit_tvaas_A.rds")
+fit_tvaas_B$save_object("stan_fits/fit_tvaas_B.rds")
+
+# Step 7: Stability analysis
+get_theta <- function(fit, index_df, col_name) {
+  fit$summary("theta", mean) |>
+    mutate(teacher_idx = as.integer(str_extract(variable, "\\d+"))) |>
+    left_join(index_df, by = "teacher_idx") |>
+    dplyr::select(teacher_id, !!col_name := mean)
+}
+
+stability_results <- list()
+
+for (model_name in c("cva", "swvam", "composite", "tvaas")) {
+  fit_A  <- get(sprintf("fit_%s_A", model_name))
+  fit_B  <- get(sprintf("fit_%s_B", model_name))
+  idx_A  <- long_A |> distinct(teacher_id, teacher_idx)
+  idx_B  <- long_B |> distinct(teacher_id, teacher_idx)
+
+  theta_A <- get_theta(fit_A, idx_A, "cohort_A")
+  theta_B <- get_theta(fit_B, idx_B, "cohort_B")
+
+  merged <- theta_A |>
+    inner_join(theta_B, by = "teacher_id") |>
+    filter(complete.cases(pick(everything())))
+
+  r <- cor(merged$cohort_A, merged$cohort_B)
+
+  q_A <- cut(merged$cohort_A, breaks=quantile(merged$cohort_A, 0:4/4),
+             labels=1:4, include.lowest=TRUE)
+  q_B <- cut(merged$cohort_B, breaks=quantile(merged$cohort_B, 0:4/4),
+             labels=1:4, include.lowest=TRUE)
+  pct_agree <- mean(q_A == q_B, na.rm=TRUE)
+
+  stability_results[[model_name]] <- tibble(
+    model          = model_name,
+    n_teachers     = nrow(merged),
+    correlation    = round(r, 3),
+    quartile_agree = round(pct_agree, 3)
+  )
+
+  cat(sprintf("%s: r=%.3f, quartile agreement=%.3f (%d teachers)\n",
+              model_name, r, pct_agree, nrow(merged)))
+}
+
+stability_df <- bind_rows(stability_results)
+print(stability_df)
+saveRDS(stability_df, "stan_fits/eclsk_stability.rds")
+```
+
+
+```{r}
+message(sprintf("Cohort A: %d rows, %d teachers, %d students",
+                nrow(long_A), n_distinct(long_A$teacher_id),
+                n_distinct(long_A$CHILDID)))
+message(sprintf("Cohort B: %d rows, %d teachers, %d students",
+                nrow(long_B), n_distinct(long_B$teacher_id),
+                n_distinct(long_B$CHILDID)))
+
+# How many would be matched across both cohorts?
+teachers_both <- intersect(long_A$teacher_id, long_B$teacher_id)
+cat(sprintf("Teachers appearing in both cohorts: %d\n", length(teachers_both)))
+```
+
+
+
+```{r}
+
+
+# Or reload if needed
+stability_df <- readRDS("stan_fits/eclsk_stability.rds")
+print(stability_df)
+```
+```{r}
+fit_cva_A       <- readRDS("stan_fits/fit_cva_A.rds")
+fit_cva_B       <- readRDS("stan_fits/fit_cva_B.rds")
+fit_swvam_A     <- readRDS("stan_fits/fit_swvam_A.rds")
+fit_swvam_B     <- readRDS("stan_fits/fit_swvam_B.rds")
+fit_composite_A <- readRDS("stan_fits/fit_composite_A.rds")
+fit_composite_B <- readRDS("stan_fits/fit_composite_B.rds")
+fit_tvaas_A     <- readRDS("stan_fits/fit_tvaas_A.rds")
+fit_tvaas_B     <- readRDS("stan_fits/fit_tvaas_B.rds")
+```
+
+
+```{r}
+for (model_name in c("cva", "swvam", "composite", "tvaas")) {
+  fit_A <- get(sprintf("fit_%s_A", model_name))
+  fit_B <- get(sprintf("fit_%s_B", model_name))
+  diag_A <- fit_A$diagnostic_summary()
+  diag_B <- fit_B$diagnostic_summary()
+  cat(sprintf("%s A — divergent: %d, EBFMI: %.3f\n",
+              model_name, sum(diag_A$num_divergent), min(diag_A$ebfmi)))
+  cat(sprintf("%s B — divergent: %d, EBFMI: %.3f\n",
+              model_name, sum(diag_B$num_divergent), min(diag_B$ebfmi)))
+}
+```
+
