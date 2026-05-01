@@ -1,0 +1,518 @@
+---
+title: "The Teacher Effect"
+subtitle: "Jacob Benson"
+format:
+  revealjs:
+    theme: serif
+    css: custom.css
+    embed-resources: true
+    center-title-slide: true
+    width: 1600
+    minScale: 0.5
+    maxScale: 1.5
+    height: 900
+    margin: 0.05
+    callout-appearance: simple
+---
+
+```{r}
+library(dplyr)
+library(car)
+library(ggplot2)
+library(mosaic)
+library(tidyr)
+library(emmeans)  
+library(psych)  # for levene
+library(effects) # for adjusted means
+library(lsr) # for effect sizes
+library(multcomp)  # for post hocs
+library(apa)
+library(ez)
+library(plotly)
+library(reshape2)
+library(nlme)
+library(lmtest)
+library(GGally)
+library(patchwork)
+library(broom.mixed)
+library(ggrepel)
+library(knitr)
+library(kableExtra)
+```
+
+#overview in english before notation
+
+say it in english, then point out differences and similarities between models. 
+
+
+
+
+# How do you evaluate a teacher? 
+
+::: fragment
+> Classroom Observations (CEL - standards based form that is filled based on those observations)
+
+:::
+
+::: fragment
+> Student Feedback 
+
+:::
+
+::: fragment
+> Teacher "Effectiveness" 
+
+:::
+
+
+
+
+## Value Added Models (VAMs): 
+```{r}
+set.seed(141229)
+n <- 80
+
+students <- tibble(
+  prior_score = rnorm(n, 50, 12),
+  noise       = rnorm(n, 0, 6)
+) |>
+  mutate(
+    current_score = 20 + 0.65 * prior_score + noise
+  )
+
+# Fit regression
+fit <- lm(current_score ~ prior_score, data = students)
+students$predicted <- predict(fit)
+
+# One highlighted student
+student <- tibble(prior_score = 55, predicted = predict(fit, newdata = tibble(prior_score = 55)))
+student$current_score <- student$predicted + 12  # above the line = positive teacher effect
+
+ggplot(students, aes(x = prior_score, y = current_score)) +
+  geom_point(alpha = 0.25, color = "grey60", size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "grey30",
+              linewidth = 1, linetype = "dashed", fill = "grey90") +
+  # Highlighted student point
+  geom_point(data = student, aes(x = prior_score, y = current_score),
+             color = "#1D9E75", size = 5) +
+  # Dot on the regression line
+  geom_point(data = student, aes(x = prior_score, y = predicted),
+             color = "grey30", size = 4, shape = 4, stroke = 1.5) +
+  # Arrow showing teacher effect
+  geom_segment(data = student,
+               aes(x = prior_score, xend = prior_score,
+                   y = predicted, yend = current_score),
+               color = "#D85A30", linewidth = 1.4,
+               arrow = arrow(ends = "both", length = unit(0.1, "inches"))) +
+  # Dashed horizontal line from prior score
+  geom_segment(data = student,
+               aes(x = prior_score, xend = prior_score,
+                   y = min(students$current_score), 
+                   yend = predicted),
+               color = "grey50", linetype = "dotted", linewidth = 0.8) +
+  geom_segment(data = student,
+               aes(x = min(students$prior_score), 
+                   xend = prior_score,
+                   y = predicted, yend = predicted),
+               color = "grey50", linetype = "dotted", linewidth = 0.8) +
+  # Labels
+  annotate("text",
+           x = student$prior_score + 2,
+           y = (student$predicted + student$current_score) / 2,
+           label = "Teacher Effect\n(+12 points)",
+           color = "#D85A30", size = 4, fontface = "bold", hjust = 0) +
+  annotate("text",
+           x = student$prior_score + 2,
+           y = student$current_score + 1.5,
+           label = "Actual score",
+           color = "#1D9E75", size = 3.5, hjust = 0) +
+  annotate("text",
+           x = student$prior_score - 18,
+           y = student$predicted + 1.5,
+           label = "Expected score",
+           color = "grey30", size = 3.5, hjust = 0, fontface = "italic") +
+  annotate("text",
+           x = 28, 
+           y = predict(fit, newdata = tibble(prior_score = 28)) - 4,
+           label = "Population average\n(prior achievement only)",
+           color = "grey30", size = 3, hjust = 0, fontface = "italic") +
+  labs(
+    x = "Prior year score",
+    y = "Current year score"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank())
+```
+
+
+## The Rise of Teacher Effects:
+
+Initially grew traction as an alternative to No Child Left Behind act's strict proficiency thresholds, aimed at increasing education quality through standardized testing and improved teacher quality. 
+
+![](figs/rttt.jpg){fig-align="center" width="50%"}
+
+Race to the Top (RttT) 2009: Increased emphasis and resources for the rigorous interventions needed to turn around the lowest-performing schools. The unintended consequence of this program was the widespread use and development of value added models. 
+
+# Objective: 
+::: {style="text-align: center;"}
+### Create a low variability, low bias, single step VAM, using combinations of existing SWVAMs and generalized linear mixed models.
+
+:::
+
+
+## Contextualized Value-Added Model (CVA):
+
+The Contextualized Value-Added model improves upon the baseline VA model (a simple regression) with the inclusion of student-level demographic covariates, thereby reducing bias attributable to the non-random assignment of students to teachers. The model is specified as:
+
+$$
+\begin{equation}
+    y_{it} = \mu_0 + \beta \, y_{i,t-1} + \boldsymbol{\gamma}^{\top} \mathbf{X}_{it}
+             + \theta_{j(i)} + \varepsilon_{it}
+\end{equation}
+$$
+
+
+---
+
+## Signal-Weighted Value-Added Model (SWVAM): 
+
+Kim (2022) proposes SWVAM to address the high variance in teacher effect estimates by introducing student-level signal parameters. It includes two additional latent parameters for each student: 
+
+![](figs/pete.jpg){fig-align="center" width="40%"}
+
+> $a_i \geq 0$ **sensitivity**: the degree to which student $i$'s
+          achievement responds to their assigned teacher's quality; a student with
+          high $a_i$ contributes more information about teacher effectiveness
+
+> $r_i \in [0, 1]$ **reliability**: the consistency with which
+          student $i$'s scores reflect teacher quality across time; a student with
+          high $r_i$ produces stable signals across repeated observations
+
+
+
+
+
+---
+
+## Composite Model
+
+
+**Applies both variance reduction and bias reduction in one step, thus allowing for signal weighting and covariate adjustment to inform each other, avoiding error propagation in a two step model. **
+
+
+
+>**SWVAM**
+$$y_{ijt} = \mu_t + a_i\theta_j + r_i\eta_i + \varepsilon_{ijt}$$
+Applied to residuals
+
+
+>**Composite**
+$$y_{ijt} = \mu_t + a_i\theta_j + r_i\eta_i + \underbrace{\mu_0 + \beta y_{i,t-1} + \gamma^\top X_{it} + \delta P_{it} + \zeta^\top S_j}_{\text{bias reduction}} + \varepsilon_{ijt}$$
+Applied to data
+
+
+
+---
+
+
+## Tennessee Value-Added Assessment System (TVAAS):
+
+Using each student's complete testing history, this model assumes that socioeconomic and background influence persist across prior score trajectory. 
+
+
+
+```{r, fig.align='center'}
+
+library(tidyverse)
+library(magick)
+library(cowplot)
+library(patchwork)
+
+# Load your photo strip
+photo <- image_read("figs/screenshot.png")
+photo_plot <- ggdraw() + draw_image(photo)
+
+# Wave labels
+wave_labels <- tibble(
+  x     = c(0.05, 0.23, 0.41, 0.59, 0.77, 0.95),
+  y     = c(0.8, 0.8, 0.8, 0.8, 0.8, 0.8),
+  label = c("Kindergarten\n(C1)", "1st Grade\n(C2)", 
+            "3rd Grade\n(C4)", "5th Grade\n(C5)",
+            "6th Grade\n(C6)", "8th Grade\n(C7)")
+)
+
+label_plot <- ggplot(wave_labels, aes(x=x, y=y, label=label)) +
+  geom_text(size=3.2, hjust=0.5, lineheight=1.0,
+            color="grey30", fontface="italic") +
+  xlim(0,1) + ylim(0,1) +
+  theme_void() +
+  theme(plot.margin = margin(0, 0, 0, 0))
+
+# Correlation matrix
+waves <- c("C2", "C4", "C5", "C6", "C7")
+cor_vals <- tribble(
+  ~w1,  ~w2,   ~r,
+  "C2", "C2",  1.000,
+  "C2", "C4",  0.744,
+  "C2", "C5",  0.696,
+  "C2", "C6",  0.634,
+  "C2", "C7",  0.599,
+  "C4", "C4",  1.000,
+  "C4", "C5",  0.718,
+  "C4", "C6",  0.731,
+  "C4", "C7",  0.481,
+  "C5", "C5",  1.000,
+  "C5", "C6",  0.853,
+  "C5", "C7",  0.731,
+  "C6", "C6",  1.000,
+  "C6", "C7",  0.800,
+  "C7", "C7",  1.000
+) |>
+  bind_rows(
+    tribble(
+      ~w1,  ~w2,   ~r,
+      "C4", "C2",  0.744,
+      "C5", "C2",  0.696,
+      "C5", "C4",  0.718,
+      "C6", "C2",  0.634,
+      "C6", "C4",  0.731,
+      "C6", "C5",  0.853,
+      "C7", "C2",  0.599,
+      "C7", "C4",  0.481,
+      "C7", "C5",  0.731,
+      "C7", "C6",  0.800
+    )
+  ) |>
+  mutate(
+    w1 = factor(w1, levels=waves),
+    w2 = factor(w2, levels=waves)
+  )
+
+cor_plot <- ggplot(cor_vals, aes(x=w2, y=fct_rev(w1), fill=r)) +
+  geom_tile(color="white", linewidth=0.5) +
+  geom_text(aes(label=sprintf("%.3f", r)),
+            size=3.5, color="white", fontface="bold") +
+  scale_fill_gradient(low="#7F77DD", high="#1D9E75",
+                      limits=c(0.4, 1),
+                      name="Correlation") +
+  scale_x_discrete(position="top") +
+  labs(x=NULL, y=NULL) +
+  theme_minimal(base_size=11) +
+  theme(
+    axis.text       = element_text(face="bold", size=11),
+    legend.position = "right",
+    panel.grid      = element_blank()
+  )
+
+
+final <- plot_grid(
+  photo_plot,
+  label_plot,
+  cor_plot,
+  ncol        = 1,
+  rel_heights = c(2.5, 1.5, 3.5, 0.5)
+)
+
+#| echo: false
+#| fig-width: 16
+#| fig-height: 11
+final
+```
+
+
+# Data
+
+## Empirical Data:
+ 
+### [Early Childhood Longitidinal Studies Kindergarden 1998-1999 (ECLS-K)]{style="color:blue;"}
+
+::: fragment
+> Nationally Representative Survey 
+
+:::
+
+::: fragment
+> Includes Private and Public Schools
+
+:::
+
+::: fragment
+> Grades recorded over 9 years of learning (Kindergarden to 8th Grade)
+
+:::
+
+
+
+
+## Limitations
+
+```{r}
+#| echo: false
+tribble(
+  ~`Students per Teacher`, ~`N Teachers`, ~`Percent`,
+  "1",   9638, 49.2,
+  "2",   2955, 15.1,
+  "3",   1963, 10.0,
+  "4",   1485,  7.6,
+  "5",    997,  5.1,
+  "6",    690,  3.5,
+  "7",    488,  2.5,
+  "8",    343,  1.8,
+  "9",    236,  1.2,
+  "10+",  794,  4.1
+) |>
+  kable(
+    caption = "Distribution of students per teacher (unfiltered ECLS-K sample)",
+    align   = c("l", "r", "r")
+  ) |>
+  kable_styling(full_width = FALSE, font_size = 35, position = "center") |>
+  row_spec(5, bold = TRUE, background = "#7F77DD", color = "white")
+```
+
+
+
+
+---
+
+
+```{r}
+#| echo: false
+#| results: asis
+
+t1 <- tibble(
+  Model                = c("CVA", "SWVAM", "Composite", "TVAAS"),
+  Correlation          = c(0.902, 0.530, 0.521, 0.633),
+  `Quartile Agreement` = c(0.580, 0.418, 0.422, 0.434),
+  `N Teachers`         = c(505, 505, 505, 505)
+) |>
+  kable(
+    caption = "Split-Sample Stability Analysis (n ≥ 5 threshold, 505 matched teachers)",
+    digits  = 3,
+    align   = c("l","r","r","r")
+  ) |>
+  kable_styling(full_width=TRUE, font_size=30, position="center") |>
+  column_spec(1, border_left=TRUE) |>
+  column_spec(4, border_right=TRUE) |>
+  row_spec(0, extra_css="border-top: 2px solid black;") |>
+  row_spec(4, extra_css="border-bottom: 2px solid black;")
+
+t2 <- tibble(
+  Model                = c("CVA", "SWVAM", "Composite", "TVAAS"),
+  Correlation          = c(0.902, 0.671, 0.686, 0.746),
+  `Quartile Agreement` = c(0.472, 0.491, 0.415, 0.509),
+  `N Teachers`         = c(53, 53, 53, 53)
+) |>
+  kable(
+    caption = "Split-Sample Stability Analysis (n ≥ 10 threshold, 53 matched teachers)",
+    digits  = 3,
+    align   = c("l","r","r","r")
+  ) |>
+  kable_styling(full_width=TRUE, font_size=30, position="center") |>
+  column_spec(1, border_left=TRUE) |>
+  column_spec(4, border_right=TRUE) |>
+  row_spec(0, extra_css="border-top: 2px solid black;") |>
+  row_spec(4, extra_css="border-bottom: 2px solid black;")
+
+asis_output(paste0(
+  "<div style='text-align: center; width: 100%;'>",
+  as.character(t1),
+  "</div>",
+  "<div style='height: 150px;'></div>",
+  "<div style='text-align: center; width: 100%;'>",
+  as.character(t2),
+  "</div>"
+))
+```
+
+
+
+## Simulated Data
+
+> Essential to visualize how well the models capture "actual" teacher value.
+
+::: {style="font-size: 1.8em;"}
+
+- Scenario A: Students have invariant latent parameters year to year
+
+
+- Scenario C: All student parameters are made randomly each year
+
+:::
+
+
+
+# Results: 
+
+
+---
+
+![](figs/000011.png){fig-align="center" width="50%"}
+
+
+---
+
+![](figs/000012.png){fig-align="center" width="50%"}
+
+
+
+---
+
+![](figs/000010.png){fig-align="center" width="50%"}
+
+
+
+
+
+---
+
+
+
+![](figs/000013.png){fig-align="center" width="50%"}
+
+## Ethical Concerns: 
+
+---
+
+![](figs/short){fig-align="center" width="50%"}
+
+
+---
+![](figs/teacher.webp){fig-align="center" width="50%"}
+
+
+
+## Acknowledgements: 
+
+
+
+## References:
+
+::: {style="font-size: 0.6em;"}
+- Amrein-Beardsley, A., Collins, C., Polasky, S., & Sloat, E. F. (2014). Value-Added Model (VAM) Research for Educational Policy: Framing the Issue. Education Policy Analysis Archives, 21. https://doi.org/10.14507/epaa.v21n4.2013 
+
+- Everson, K. C., Feinauer, E., & Sudweeks, R. (2013). Rethinking Teacher Evaluation: A Conversation about Statistical Inferences and Value-Added Models. Harvard Educational Review, 83(2), 349–370. https://doi.org/10.17763/haer.83.2.m32hk8q851u752h0 
+
+- Gordon, G., & Morse, E. V. (1975). Evaluation Research. Annual Review of Sociology, 1(Volume 1, 1975), 339–361. https://doi.org/10.1146/annurev.so.01.080175.002011 
+
+- Hallinger, P., Heck, R. H., & Murphy, J. (2014). Teacher evaluation and school improvement: An analysis of the evidence. Educational Assessment, Evaluation and Accountability, 26(1), 5–28. https://doi.org/10.1007/s11092-013-9179-5 
+
+- Hanushek, E. A., & Rivkin, S. G. (2012). The Distribution of Teacher Quality and Implications for Policy. Annual Review of Economics, 4(Volume 4, 2012), 131–157. https://doi.org/10.1146/annurev-economics-080511-111001 
+
+- Jackson, C. K., Rockoff, J. E., & Staiger, D. O. (2014). Teacher Effects and Teacher-Related Policies. Annual Review of Economics, 6(Volume 6, 2014), 801–825. https://doi.org/10.1146/annurev-economics-080213-040845 
+
+- Kim, E. J. (2022). Signal Weighted Teacher Value-Added Models. Statistics and Public Policy, 9(1), 149–162. https://doi.org/10.1080/2330443X.2022.2105769 
+
+- Lavigne, A. L. (2014). Exploring the Intended and Unintended Consequences of High-Stakes Teacher Evaluation on Schools, Teachers, and Students. Teachers College Record, 116(1), 1–29. https://doi.org/10.1177/016146811411600103 
+
+- Leckie, G., & Prior, L. (2022). A comparison of value-added models for school accountability. School Effectiveness and School Improvement, 33(3), 431–455. https://doi.org/10.1080/09243453.2022.2032763 
+
+- Paufler, N. A. (2018). Declining Morale, Diminishing Autonomy, and Decreasing Value: Principal Reflections on a High-Stakes Teacher Evaluation System. International Journal of Education Policy and Leadership, 13(8). https://doi.org/10.22230/ijepl.2018v13n8a813 
+
+- Sage Journals: Discover world-class research. (n.d.). Sage Journals. Retrieved February 3, 2026, from https://journals.sagepub.com/loi/epm 
+
+- Wright, S. P., White, J. T., & Sanders, W. L. (n.d.). SAS® EVAAS® Statistical Models. StAtiSticAl ModElS. 
+:::
+
+
+
+
